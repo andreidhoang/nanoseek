@@ -120,7 +120,7 @@ class YaRNConfig:
     extension beyond original training length (4096 → 128K+).
 
     NanoSeek Strategy (following DeepSeek):
-    - Train at 4K context (optimal for 561M model, $100 budget)
+    - Train at 4K context (optimal for 1B model, $100 budget)
     - YaRN extends to 16K-32K at inference time
     - DSA activates for extended context, making it compute-efficient
 
@@ -271,7 +271,7 @@ class MLAConfig:
         Standard MHA: 2 * num_heads * head_dim
         MLA: kv_lora_rank + qk_rope_head_dim (RoPE is shared!)
 
-        Example for NanoSeek-700M (hidden=2048, num_heads=16):
+        Example for NanoSeek-1B (hidden=2048, num_heads=16):
         - Standard: 2 * 16 * 128 = 4096
         - MLA: 143 + 32 = 175
         - Compression: ~23x
@@ -293,7 +293,7 @@ class MoEConfig:
 
     Reference: DeepSeek-V3 Technical Report (Section 3.2)
     """
-    # Expert configuration (aligned with 700M config)
+    # Expert configuration (aligned with 1B config)
     # 64 experts, 8 active = 12.5% activation (DeepSeek standard)
     n_routed_experts: int = 64           # Total number of routed experts
     num_experts_per_tok: int = 8         # Active experts per token (DeepSeek's optimal k)
@@ -568,7 +568,7 @@ class NanoSeekConfig:
     # Distributed Configuration (legacy - use parallel config instead)
     # ========================================================================
     # NOTE: These are kept for backward compatibility but parallel config is preferred
-    # For 8xH100, NanoSeek-561M fits on single GPU with DP=8
+    # For 8xH100, NanoSeek-1B fits on single GPU with DP=8
     data_parallel_size: int = 8          # Use parallel.world_size instead
     # pipeline_parallel_size and expert_parallel_size moved to parallel config
 
@@ -610,7 +610,7 @@ class NanoSeekConfig:
         """
         Estimated total parameters (including all MoE experts).
 
-        Breakdown for NanoSeek-700M (hidden=2048, layers=16):
+        Breakdown for NanoSeek-1B (hidden=2048, layers=16):
         - Embeddings: 65536 × 2048 × 2 = 268M
         - MLA (16 layers): 16 × ~5M = 80M
         - Dense FFN (2 layers): 2 × 32M = 64M
@@ -652,7 +652,7 @@ class NanoSeekConfig:
         """
         Estimated active parameters per forward pass.
 
-        For NanoSeek-700M: ~700M active (embeddings + MLA + shared + k routed)
+        For NanoSeek-1B: ~1.08B active (embeddings + MLA + shared + k routed)
 
         Breakdown:
         - Embeddings: 268M
@@ -661,7 +661,7 @@ class NanoSeekConfig:
         - Shared experts (14 layers × 2): 132M
         - Active routed (14 layers × 8): 14 × 8 × 4.7M = 526M
         - Norms: ~2M
-        Total: ~700M (accounting for shared weights with MTP)
+        Total: ~1.08B (accounting for shared weights with MTP)
         """
         # Embeddings (input + output)
         embed_params = self.vocab_size * self.hidden_size
@@ -937,7 +937,7 @@ def get_nanoseek_config() -> NanoSeekConfig:
         # MoE Configuration (DeepSeek-optimal)
         # ====================================================================
         # 64 experts, 8 active = 12.5% activation (DeepSeek standard)
-        # Expert size: 768 achieves ~700M active params
+        # Expert size: 768 achieves ~1B active params
         moe=MoEConfig(
             n_routed_experts=64,         # DeepSeek's proven expert count for this scale
             num_experts_per_tok=8,       # DeepSeek's optimal k

@@ -121,7 +121,7 @@ def create_sample_config(output_dir: Path):
 # Copy this file and modify for your setup
 
 # Model
-model_size: "1b"  # Options: 125m, 500m, 1b
+model_size: "1b"  # Options: 500m, 1b
 
 # Data
 data_dir: "./data/base_data"

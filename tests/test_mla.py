@@ -51,13 +51,13 @@ class TestMLACompression:
         assert k_pe.shape == (batch, seq, 1, 16), \
             f"Expected K_PE shape (2, 64, 1, 16), got {k_pe.shape}"
 
-    def test_compression_ratio(self, config_700m):
+    def test_compression_ratio(self, config_1b):
         """Verify MLA achieves >20x compression."""
         # Standard MHA: 2 * num_heads * head_dim per layer per token
-        mha_size = 2 * config_700m.num_heads * config_700m.head_dim
+        mha_size = 2 * config_1b.num_heads * config_1b.head_dim
 
         # MLA: kv_lora_rank + qk_rope_head_dim
-        mla_size = config_700m.mla.kv_lora_rank + config_700m.mla.qk_rope_head_dim
+        mla_size = config_1b.mla.kv_lora_rank + config_1b.mla.qk_rope_head_dim
 
         compression = mha_size / mla_size
 
@@ -304,20 +304,20 @@ class TestMLANumericalStability:
 class TestMLAConfigIntegration:
     """Test MLA creation from config."""
 
-    def test_create_from_config(self, config_700m, device):
+    def test_create_from_config(self, config_1b, device):
         """Test creating MLA from config."""
-        mla = create_mla_from_config(config_700m, layer_idx=0).to(device)
+        mla = create_mla_from_config(config_1b, layer_idx=0).to(device)
 
-        x = torch.randn(2, 64, config_700m.hidden_size, device=device)
+        x = torch.randn(2, 64, config_1b.hidden_size, device=device)
         output, cache = mla(x, use_cache=True)
 
         assert output.shape == x.shape
         assert cache is not None
 
-    def test_layer_idx_affects_nothing_critical(self, config_700m, device):
+    def test_layer_idx_affects_nothing_critical(self, config_1b, device):
         """Verify different layer indices produce valid outputs."""
         for layer_idx in [0, 5, 10]:
-            mla = create_mla_from_config(config_700m, layer_idx=layer_idx).to(device)
-            x = torch.randn(2, 32, config_700m.hidden_size, device=device)
+            mla = create_mla_from_config(config_1b, layer_idx=layer_idx).to(device)
+            x = torch.randn(2, 32, config_1b.hidden_size, device=device)
             output, _ = mla(x)
             check_no_nan_inf(output, f"MLA output (layer {layer_idx})")

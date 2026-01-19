@@ -330,20 +330,20 @@ class TestMoEStats:
 class TestMoEConfigIntegration:
     """Test MoE creation from config."""
 
-    def test_create_from_config(self, config_700m, device):
+    def test_create_from_config(self, config_1b, device):
         """Test creating MoE from config."""
-        moe = create_moe_from_config(config_700m).to(device)
+        moe = create_moe_from_config(config_1b).to(device)
 
-        x = torch.randn(2, 64, config_700m.hidden_size, device=device)
+        x = torch.randn(2, 64, config_1b.hidden_size, device=device)
         output, _ = moe(x)
 
         assert output.shape == x.shape
         check_no_nan_inf(output, "MoE from config output")
 
-    def test_config_expert_count(self, config_700m):
+    def test_config_expert_count(self, config_1b):
         """Verify expert count matches config."""
-        moe = create_moe_from_config(config_700m)
+        moe = create_moe_from_config(config_1b)
 
-        assert len(moe.experts) == config_700m.moe.n_routed_experts
-        if config_700m.moe.n_shared_experts > 0:
-            assert len(moe.shared_experts) == config_700m.moe.n_shared_experts
+        assert len(moe.experts) == config_1b.moe.n_routed_experts
+        if config_1b.moe.n_shared_experts > 0:
+            assert len(moe.shared_experts) == config_1b.moe.n_shared_experts

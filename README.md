@@ -90,10 +90,10 @@ Training follows Chinchilla scaling: **20× tokens per active parameter** (22B t
 | Layers | 16 |
 | Attention Heads | 16 |
 | **Active Parameters** | ~1.08B |
-| **Total Parameters** | ~4.87B |
+| **Total Parameters** | ~4.75B |
 | Experts (Routed + Shared) | 64 + 2 |
 | Active Experts | 8 |
-| KV Compression | 23× |
+| KV Compression Dims | 175 (kv_lora_rank + rope) |
 | Context Length | 4K (train) / 32K (infer) |
 
 ---
@@ -137,16 +137,15 @@ print(f"Active params: {sum(p.numel() for p in model.parameters() if p.requires_
 ### Quick Training
 
 ```bash
-# CPU/MacBook test (small model, short sequences)
+# Quick test (100 iterations)
 python scripts/pre-train.py \
-  --model_size=125m \
-  --max_seq_len=512 \
+  --num_iterations=100 \
   --device_batch_size=1 \
-  --num_iterations=100
+  --max_seq_len=512
 
-# Single GPU training
+# Single GPU training (Chinchilla optimal: 20x tokens per param)
 python scripts/pre-train.py \
-  --model_size=1b \
+  --target_param_data_ratio=20.0 \
   --max_seq_len=4096
 
 # Multi-GPU distributed training (8×H100)
@@ -288,8 +287,8 @@ config = get_nanoseek_config()
 
 # Architecture
 config.hidden_size          # 2048
-config.num_hidden_layers    # 16
-config.num_attention_heads  # 16
+config.num_layers           # 16
+config.num_heads            # 16
 config.vocab_size           # 65536
 config.max_position_embeddings  # 4096
 
@@ -299,20 +298,20 @@ config.mla.kv_lora_rank     # 143 (0.07 × hidden)
 config.mla.qk_rope_head_dim # 32
 
 # MoE
-config.moe.num_experts      # 64
-config.moe.num_shared_experts  # 2
+config.moe.n_routed_experts    # 64
+config.moe.n_shared_experts    # 2
 config.moe.num_experts_per_tok # 8
-config.moe.use_sigmoid_scoring # True
-config.moe.aux_loss_free    # True
+config.moe.scoring_func        # "sigmoid"
+config.moe.gamma               # 0.001 (aux-loss-free balancing)
 
 # MTP
-config.mtp.num_nextn_predict_layers  # 1
-config.mtp.mtp_loss_weight  # 0.3 → 0.1
+config.mtp.num_mtp_modules       # 1
+config.mtp.mtp_loss_weight       # 0.3 → 0.1 (dynamic schedule)
 
 # Training
-config.training.total_tokens    # 22B
-config.training.global_batch_size  # 128
-config.training.learning_rate   # 3e-4 → 3e-5
+config.total_tokens             # 22B
+config.global_batch_size        # 128
+config.learning_rate            # 3e-4 → 3e-5
 ```
 
 ### Custom Configuration
@@ -322,12 +321,12 @@ from model.config import NanoSeekConfig, MLAConfig, MoEConfig
 
 config = NanoSeekConfig(
     hidden_size=1024,
-    num_hidden_layers=12,
+    num_layers=12,
     mla=MLAConfig(
         kv_lora_rank=71,  # Maintain 0.07× ratio
     ),
     moe=MoEConfig(
-        num_experts=32,
+        n_routed_experts=32,
         num_experts_per_tok=4,
     ),
 )
@@ -337,8 +336,8 @@ config = NanoSeekConfig(
 
 ```python
 from model.config import (
-    get_nanoseek_config,      # Default 1B
-    get_nanoseek_500m_config, # Smaller variant
+    get_nanoseek_config,      # Default 1B active (~4.75B total)
+    get_nanoseek_500m_config, # Smaller variant (~500M active)
 )
 ```
 
@@ -348,10 +347,10 @@ from model.config import (
 
 ### Prerequisites
 
-1. **Data**: Download FineWeb-Edu dataset
+1. **Data**: Setup FineWeb-Edu dataset
    ```bash
-   # Using HuggingFace datasets
-   python scripts/download_data.py --dataset=fineweb-edu --tokens=100B
+   # Setup data directory and download
+   python scripts/setup_data.py --dataset=fineweb-edu --tokens=10B
    ```
 
 2. **Hardware**:
@@ -362,33 +361,29 @@ from model.config import (
 ### Training Commands
 
 ```bash
-# Development (CPU, reduced model)
+# Development (small test)
 python scripts/pre-train.py \
-  --model_size=125m \
-  --max_seq_len=512 \
-  --device_batch_size=1 \
   --num_iterations=100 \
-  --device=cpu
+  --max_seq_len=512 \
+  --device_batch_size=1
 
-# Single GPU (A100/H100)
+# Single GPU (A100/H100) - Chinchilla optimal
 python scripts/pre-train.py \
-  --model_size=1b \
-  --max_seq_len=4096 \
-  --device_batch_size=4 \
-  --gradient_accumulation_steps=8
-
-# Multi-GPU (8× H100)
-torchrun --nproc_per_node=8 scripts/pre-train.py \
-  --model_size=1b \
+  --target_param_data_ratio=20.0 \
   --max_seq_len=4096 \
   --device_batch_size=4
 
-# Multi-phase training (dense → sparse)
+# Multi-GPU (8× H100)
+torchrun --nproc_per_node=8 scripts/pre-train.py \
+  --target_param_data_ratio=20.0 \
+  --max_seq_len=4096 \
+  --device_batch_size=4
+
+# Multi-phase training (dense → sparse DSA)
 python scripts/pre-train.py \
-  --model_size=1b \
-  --enable_dsa \
-  --phase1_tokens=17.6B \
-  --phase2_tokens=4.4B
+  --enable_multiphase=true \
+  --phase1_token_fraction=0.8 \
+  --phase2_context_length=8192
 ```
 
 ### Training Monitoring
@@ -430,21 +425,22 @@ Before full training, we recommend a **100M token validation run** to verify the
 ### Run Validation
 
 ```bash
-# Single GPU validation (recommended first step)
+# Single GPU validation (~100M tokens, recommended first step)
 python scripts/pre-train.py \
-  --model_size=500m \
+  --num_iterations=200 \
   --max_seq_len=2048 \
-  --total_tokens=100_000_000 \
   --device_batch_size=4 \
+  --total_batch_size=524288 \
+  --use_wandb=true \
   --wandb_project=nanoseek-validation
 
-# Even smaller test (CPU/laptop)
+# Quick sanity check (CPU/laptop, ~10M tokens)
 python scripts/pre-train.py \
-  --model_size=125m \
+  --num_iterations=100 \
   --max_seq_len=512 \
-  --total_tokens=10_000_000 \
   --device_batch_size=1 \
-  --device=cpu
+  --total_batch_size=65536 \
+  --compile_model=false
 ```
 
 ### What to Look For

@@ -29,11 +29,11 @@ Multi-Phase DSA Training (DeepSeek V3 methodology):
 Architecture Comparison (vs nanochat d20):
 ===============================================================================
 
-                    nanochat d20          NanoSeek-561M
-                    ────────────          ─────────────
-Active Params       561M                  561M (same FLOPs!)
-Total Params        561M                  2.8B (5x via MoE)
-KV Cache/Layer      2560 dims             106 dims (24x smaller)
+                    nanochat d20          NanoSeek-1B
+                    ────────────          ───────────
+Active Params       561M                  1.08B
+Total Params        561M                  4.75B (4.4x via MoE)
+KV Cache/Layer      2560 dims             175 dims (23x smaller)
 Attention           Standard MHA          MLA (low-rank)
 FFN                 Dense                 MoE (4/32 active)
 Predictions         1 token               2 tokens (MTP)
@@ -204,7 +204,7 @@ class TrainingConfig:
     # ========================================================================
     # Model Selection
     # ========================================================================
-    model_size: str = "700m"              # Default to 700M active / 3.5B total (DeepSeek-aligned)              
+    model_size: str = "1b"                # Default to 1.08B active / 4.75B total (DeepSeek-aligned)              
 
     # ========================================================================
     # Hardware Configuration
@@ -303,12 +303,12 @@ class TrainingConfig:
     # ========================================================================
     # Note on Parallelism Strategy
     # ========================================================================
-    # NanoSeek-700M (3.5B total / 700M active) memory per GPU with DDP:
-    #   - Model weights (bf16):    ~7 GB
-    #   - Gradients (bf16):        ~7 GB
-    #   - AdamW states (fp32):    ~28 GB
-    #   - Activations:            ~10 GB
-    #   - Total:                  ~52 GB (fits in H100 80GB with headroom)
+    # NanoSeek-1B (4.75B total / 1.08B active) memory per GPU with DDP:
+    #   - Model weights (bf16):    ~9.5 GB
+    #   - Gradients (bf16):        ~9.5 GB
+    #   - AdamW states (fp32):    ~57 GB
+    #   - Activations:            ~15 GB
+    #   - Total:                  ~91 GB (requires H100 80GB with optimizer sharding)
     #
     # DDP is sufficient and preferred for this model size.
     # FSDP would add unnecessary communication overhead.
@@ -380,14 +380,14 @@ def get_model_config(model_size: str, max_seq_len: int) -> NanoSeekConfig:
     Get NanoSeekConfig for the specified model size.
 
     Args:
-        model_size: "700m" - NanoSeek-700M (700M active / 3.5B total, DeepSeek-aligned)
+        model_size: "1b" - NanoSeek-1B (1.08B active / 4.75B total, DeepSeek-aligned)
         max_seq_len: Maximum sequence length (overrides config default)
 
     Returns:
         NanoSeekConfig with sequence_length set to max_seq_len
     """
-    if model_size != "700m":
-        raise ValueError(f"Unknown model size: {model_size}. Use '700m' for NanoSeek-700M.")
+    if model_size != "1b":
+        raise ValueError(f"Unknown model size: {model_size}. Use '1b' for NanoSeek-1B.")
 
     config = get_nanoseek_config()
 
@@ -1139,7 +1139,7 @@ def main():
     # ========================================================================
     # Distributed Data Parallel (DDP)
     # ========================================================================
-    # DDP is sufficient for NanoSeek-700M (3.5B total params):
+    # DDP is sufficient for NanoSeek-1B (4.75B total params):
     #   - Each GPU holds full model replica (~52GB with optimizer states)
     #   - H100 80GB has ample headroom
     #   - No sharding overhead = faster training

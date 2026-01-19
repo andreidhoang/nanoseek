@@ -228,19 +228,19 @@ class TestParameterCount:
         assert trainable == total, "All params should be trainable by default"
 
     @pytest.mark.slow
-    def test_700m_param_count(self, config_700m, device):
-        """Test 700M configuration param count."""
-        model = NanoSeekModel(config_700m).to(device)
+    def test_1b_param_count(self, config_1b, device):
+        """Test 1B configuration param count (1.08B active / 4.75B total)."""
+        model = NanoSeekModel(config_1b).to(device)
 
         total = sum(p.numel() for p in model.parameters())
-        active = config_700m.estimated_active_params
+        active = config_1b.estimated_active_params
 
-        print(f"NanoSeek-700M: total={total:,}, active={active:,}")
+        print(f"NanoSeek-1B: total={total:,}, active={active:,}")
 
-        # Active should be in reasonable range for the 700M-1B class
-        assert 500_000_000 < active < 1_500_000_000, f"Active params: {active:,}"
-        # Total should be 3-6B (5x expansion ratio)
-        assert 2_000_000_000 < total < 7_000_000_000, f"Total params: {total:,}"
+        # Active should be ~1.08B (0.9B to 1.3B range)
+        assert 900_000_000 < active < 1_300_000_000, f"Active params: {active:,}"
+        # Total should be ~4.75B (4B to 6B range)
+        assert 4_000_000_000 < total < 6_000_000_000, f"Total params: {total:,}"
 
 
 class TestGeneration:

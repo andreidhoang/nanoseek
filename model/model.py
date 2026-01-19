@@ -219,10 +219,15 @@ class MultiHeadLatentAttention(nn.Module):
     """
     Multi-head Latent Attention (MLA) from DeepSeek-V2/V3.
 
-    Key innovations for 14x KV cache compression:
-    1. Low-rank KV joint compression
-    2. Decoupled RoPE
+    Key innovations for ~23x KV cache compression:
+    1. Low-rank KV joint compression (kv_lora_rank)
+    2. Decoupled RoPE (shared qk_rope_head_dim across all heads)
     3. Fused projections
+
+    KV cache comparison (for hidden=2048, num_heads=16, head_dim=128):
+    - Standard MHA: 2 * num_heads * head_dim = 4096 per token
+    - MLA: kv_lora_rank + qk_rope_head_dim = 143 + 32 = 175 per token
+    - Compression: 4096 / 175 ≈ 23x
     """
 
     def __init__(
@@ -1888,16 +1893,16 @@ class NanoSeekModel(nn.Module):
 
 def create_nanoseek(config: NanoSeekConfig = None) -> NanoSeekModel:
     """
-    Create NanoSeek-700M model (DeepSeek-aligned research-optimal config).
+    Create NanoSeek-1B model (DeepSeek-aligned research-optimal config).
 
-    Architecture: 700M active / 3.5B total params
+    Architecture: 1.08B active / 4.75B total params
     - d/L = 128 (matches OLMoE-1B, LLaMA-7B scale)
     - 64 experts, 8 active (DeepSeek's optimal k)
     - All DeepSeek V3 ratios preserved
-    - Training: 14B tokens (Chinchilla optimal)
+    - Training: 22B tokens (Chinchilla optimal)
 
     Args:
-        config: Optional custom config. If None, uses default 700M config.
+        config: Optional custom config. If None, uses default 1B config.
 
     Returns:
         NanoSeekModel instance.
@@ -1909,7 +1914,7 @@ def create_nanoseek(config: NanoSeekConfig = None) -> NanoSeekModel:
 
 def test_nanoseek():
     """Test NanoSeek model with main config."""
-    print("NanoSeek-700M Model Test")
+    print("NanoSeek-1B Model Test")
     print("=" * 60)
 
     config = get_nanoseek_config()

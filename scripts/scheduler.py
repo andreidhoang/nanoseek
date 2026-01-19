@@ -332,7 +332,7 @@ if __name__ == "__main__":
         warmup_steps=1000,
     )
 
-    print("\nDeepSeek Schedule (NanoSeek-561M):")
+    print("\nDeepSeek Schedule (NanoSeek-1B):")
     print(f"  Total steps: {total_steps}")
     print(f"  Warmup: 0-1000")
     print(f"  Constant: 1000-{scheduler.constant_end}")

@@ -67,8 +67,8 @@ def device():
 # =============================================================================
 
 @pytest.fixture
-def config_700m():
-    """NanoSeek-700M configuration - main config."""
+def config_1b():
+    """NanoSeek-1B configuration - main config (1.08B active / 4.75B total)."""
     return get_nanoseek_config()
 
 
@@ -125,9 +125,9 @@ def model_minimal(minimal_config, device):
 
 
 @pytest.fixture
-def model_700m(config_700m, device):
-    """NanoSeek-700M model - main model."""
-    model = NanoSeekModel(config_700m)
+def model_1b(config_1b, device):
+    """NanoSeek-1B model - main model (1.08B active / 4.75B total)."""
+    model = NanoSeekModel(config_1b)
     return model.to(device)
 
 
@@ -243,12 +243,12 @@ def sample_batch_minimal(minimal_config, device):
 
 
 @pytest.fixture
-def sample_batch_700m(config_700m, device):
-    """Sample batch for 700M config."""
+def sample_batch_1b(config_1b, device):
+    """Sample batch for 1B config."""
     batch_size, seq_len = 2, 128
     return {
-        'input_ids': torch.randint(0, config_700m.vocab_size, (batch_size, seq_len), device=device),
-        'labels': torch.randint(0, config_700m.vocab_size, (batch_size, seq_len), device=device),
+        'input_ids': torch.randint(0, config_1b.vocab_size, (batch_size, seq_len), device=device),
+        'labels': torch.randint(0, config_1b.vocab_size, (batch_size, seq_len), device=device),
         'attention_mask': torch.ones(batch_size, seq_len, dtype=torch.bool, device=device),
     }
 
@@ -261,10 +261,10 @@ def sample_hidden_minimal(minimal_config, device):
 
 
 @pytest.fixture
-def sample_hidden_700m(config_700m, device):
-    """Sample hidden states for 700M config."""
+def sample_hidden_1b(config_1b, device):
+    """Sample hidden states for 1B config."""
     batch_size, seq_len = 2, 128
-    return torch.randn(batch_size, seq_len, config_700m.hidden_size, device=device)
+    return torch.randn(batch_size, seq_len, config_1b.hidden_size, device=device)
 
 
 # =============================================================================
