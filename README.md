@@ -15,6 +15,7 @@
 [Quick Start](#-quick-start) •
 [Architecture](#-architecture) •
 [Training](#-training) •
+[Optimizers](#-optimizer-selection-muon-vs-adamw) •
 [Validation](#-validation-run-100m-tokens) •
 [Contributing](#-contributing)
 
@@ -408,6 +409,109 @@ The training script tracks:
 - **Expert Balance**: Load distribution across experts
 - **Memory**: GPU memory usage, KV cache size
 - **Speed**: Tokens/second, iterations/second
+
+---
+
+## 🔧 Optimizer Selection: Muon vs AdamW
+
+NanoSeek supports two optimizers with different strengths. Understanding when to use each is crucial for efficient training.
+
+### Overview
+
+| Optimizer | Best For | Learning Rate | Memory |
+|-----------|----------|---------------|--------|
+| **AdamW** | Most parameters, production training | 3e-4 → 3e-5 | Higher (2 states) |
+| **Muon** | Linear layers, experimental speedup | 0.02 (no warmup) | Lower (momentum only) |
+
+### AdamW (Default)
+
+The industry-standard optimizer for LLM training, used by DeepSeek, GPT, LLaMA, and most production models.
+
+**When to use AdamW:**
+- ✅ Full model training (default choice)
+- ✅ Embeddings and normalization layers
+- ✅ MoE expert weights and routers
+- ✅ MTP prediction heads
+- ✅ Production training runs
+- ✅ When following published recipes
+
+**Configuration:**
+```python
+from scripts.scheduler import create_optimizer
+
+optimizer = create_optimizer(
+    model=model,
+    lr=3e-4,              # Peak learning rate
+    weight_decay=0.1,     # Standard for LLMs
+    beta1=0.9,            # Momentum
+    beta2=0.95,           # DeepSeek's choice (vs 0.999 default)
+    eps=1e-8,
+)
+```
+
+**Why beta2=0.95?** DeepSeek uses a lower beta2 than the default 0.999. This makes the optimizer more responsive to recent gradient magnitudes, helpful for the dynamic expert routing in MoE architectures.
+
+### Muon (Experimental)
+
+A newer optimizer that showed promising results in [nanochat](https://github.com/KellerJordan/modded-nanogpt) experiments, achieving faster convergence on linear layers.
+
+**When to use Muon:**
+- ✅ Linear layer weights only (attention projections, FFN layers)
+- ✅ Experimental/research training
+- ✅ When exploring faster convergence
+- ✅ Memory-constrained scenarios
+
+**When NOT to use Muon:**
+- ❌ Embeddings (use AdamW)
+- ❌ Normalization layers (use AdamW)
+- ❌ Router/gating weights (use AdamW)
+- ❌ Production training (not yet validated at scale)
+
+**Configuration:**
+```python
+from scripts.scheduler import MuonScheduler
+
+# Muon uses different LR schedule: no warmup, 20% warmdown
+scheduler = MuonScheduler(
+    optimizer=muon_optimizer,
+    lr_max=0.02,           # Much higher than AdamW!
+    total_steps=21400,
+    warmdown_ratio=0.2,    # Decay in final 20%
+)
+```
+
+### Hybrid Approach (Advanced)
+
+For optimal results, use both optimizers with separate parameter groups:
+
+```python
+# Split parameters by type
+adamw_params = []  # Embeddings, norms, routers
+muon_params = []   # Linear layer weights
+
+for name, param in model.named_parameters():
+    if any(x in name.lower() for x in ['embed', 'norm', 'gate', 'bias']):
+        adamw_params.append(param)
+    else:
+        muon_params.append(param)
+
+# Create separate optimizers
+adamw_optimizer = torch.optim.AdamW(adamw_params, lr=3e-4, weight_decay=0.1)
+muon_optimizer = Muon(muon_params, lr=0.02, momentum=0.95)
+```
+
+### Summary: Which Optimizer to Choose?
+
+| Scenario | Recommendation |
+|----------|----------------|
+| First training run | **AdamW** (proven, documented) |
+| Following DeepSeek recipe | **AdamW** |
+| Memory-constrained | **Muon** for linear layers |
+| Research/experimentation | **Hybrid** or **Muon** |
+| Maximum reliability | **AdamW** |
+| Maximum speed (experimental) | **Hybrid** |
+
+**Default recommendation:** Start with AdamW. It's well-understood, matches published results, and is the safer choice. Explore Muon only after you have a working AdamW baseline.
 
 ---
 
