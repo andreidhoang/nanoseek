@@ -51,8 +51,10 @@ from .model import (
     # Model
     NanoSeekDecoderLayer,
     NanoSeekModel,
-    # Factory function
+    # Factory functions
     create_nanoseek,
+    create_mla_from_config as _create_mla_from_config_core,
+    create_moe_from_config as _create_moe_from_config_core,
     # Test
     test_nanoseek,
 )
@@ -86,35 +88,17 @@ except ImportError:
 # Helper Functions
 # =============================================================================
 
-def create_mla_from_config(config: NanoSeekConfig) -> MultiHeadLatentAttention:
+def create_mla_from_config(
+    config: NanoSeekConfig,
+    layer_idx: int = 0,
+) -> MultiHeadLatentAttention:
     """Create MLA from NanoSeek config."""
-    return MultiHeadLatentAttention(
-        hidden_size=config.hidden_size,
-        num_heads=config.num_heads,
-        q_lora_rank=config.mla.q_lora_rank,
-        kv_lora_rank=config.mla.kv_lora_rank,
-        qk_nope_head_dim=config.mla.qk_nope_head_dim,
-        qk_rope_head_dim=config.mla.qk_rope_head_dim,
-        v_head_dim=config.mla.v_head_dim,
-        max_position_embeddings=config.max_position_embeddings,
-        rope_theta=config.mla.rope_theta,
-        attention_dropout=config.attention_dropout,
-    )
+    return _create_mla_from_config_core(config, layer_idx=layer_idx)
+
 
 def create_moe_from_config(config: NanoSeekConfig) -> MoE:
     """Create MoE from NanoSeek config."""
-    return MoE(
-        dim=config.hidden_size,
-        moe_inter_dim=config.moe.moe_intermediate_size,
-        n_routed_experts=config.moe.n_routed_experts,
-        n_activated_experts=config.moe.num_experts_per_tok,
-        n_shared_experts=config.moe.n_shared_experts,
-        n_expert_groups=config.moe.n_group,
-        n_limited_groups=config.moe.topk_group,
-        score_func=config.moe.scoring_func,
-        route_scale=config.moe.routed_scaling_factor,
-        seq_aux_loss_alpha=config.moe.seq_aux_loss_alpha,
-    )
+    return _create_moe_from_config_core(config)
 
 # =============================================================================
 # Optional: Advanced Indexer (for training)

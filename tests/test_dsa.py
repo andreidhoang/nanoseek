@@ -295,3 +295,52 @@ class TestDSACompressedRepresentations:
         check_no_nan_inf(q_compressed, "Q compressed")
         check_no_nan_inf(kv_compressed, "KV compressed")
         check_no_nan_inf(k_pe, "K PE")
+
+
+def test_dsa_uses_mla_mscale_from_config(minimal_config, device):
+    """DSA sidecar should propagate MLA mscale into wrapped MLA softmax scale."""
+    sparse_config = SparseAttentionConfig(enabled=True, topk_tokens=8, activation_threshold=1, dense_warmup_steps=0)
+    mscale = 1.7
+    dsa = DSASparseAttention(
+        hidden_size=minimal_config.hidden_size,
+        num_heads=minimal_config.num_heads,
+        q_lora_rank=minimal_config.mla.q_lora_rank,
+        kv_lora_rank=minimal_config.mla.kv_lora_rank,
+        qk_nope_head_dim=minimal_config.mla.qk_nope_head_dim,
+        qk_rope_head_dim=minimal_config.mla.qk_rope_head_dim,
+        v_head_dim=minimal_config.mla.v_head_dim,
+        mscale=mscale,
+        sparse_config=sparse_config,
+    ).to(device)
+
+    expected = mscale / (dsa.qk_head_dim ** 0.5)
+    assert torch.isclose(torch.tensor(dsa.mla.softmax_scale), torch.tensor(expected), atol=1e-7)
+
+
+def test_indexer_loss_uses_cache_position_offset(dsa_minimal, device):
+    """Indexer loss should account for cache length when building causal masks."""
+    dsa_minimal.train()
+
+    hidden = dsa_minimal.hidden_size
+    prefix = torch.randn(1, 12, hidden, device=device)
+    current = torch.randn(1, 4, hidden, device=device)
+
+    with torch.no_grad():
+        _, cache, _ = dsa_minimal(prefix, use_cache=True)
+
+    calls = {}
+    orig_create_mask = dsa_minimal._create_causal_mask
+
+    def spy_create_mask(q_len, kv_len, device_, position_offset=0):
+        calls['position_offset'] = position_offset
+        return orig_create_mask(q_len, kv_len, device_, position_offset)
+
+    dsa_minimal._create_causal_mask = spy_create_mask
+    try:
+        loss = dsa_minimal._compute_indexer_loss(current, cache)
+    finally:
+        dsa_minimal._create_causal_mask = orig_create_mask
+
+    assert 'position_offset' in calls
+    assert calls['position_offset'] == 12
+    assert torch.isfinite(loss)
