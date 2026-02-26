@@ -877,7 +877,14 @@ class MTPModule(nn.Module):
         normed_hidden = self.hidden_norm(prev_hidden)
 
         if target_tokens is not None and self.embed_tokens is not None:
-            token_embeds = self.embed_tokens(target_tokens)
+            # Ignore-label support: training labels may contain -100 which is
+            # valid for CE ignore_index but invalid for embedding lookup.
+            safe_target_tokens = torch.where(
+                target_tokens < 0,
+                torch.zeros_like(target_tokens),
+                target_tokens,
+            )
+            token_embeds = self.embed_tokens(safe_target_tokens)
             normed_embeds = self.embed_norm(token_embeds)
         else:
             normed_embeds = torch.zeros(
@@ -1114,6 +1121,8 @@ class DSASparseAttention(nn.Module):
         max_position_embeddings: int = 2048,
         rope_theta: float = 10000.0,
         rope_scaling_factor: float = 1.0,
+        original_max_position_embeddings: int = 4096,
+        mscale: float = 1.0,
         attention_dropout: float = 0.0,
         layer_idx: int = 0,
         sparse_config: Optional[SparseAttentionConfig] = None,
@@ -1138,7 +1147,9 @@ class DSASparseAttention(nn.Module):
             kv_lora_rank=kv_lora_rank, qk_nope_head_dim=qk_nope_head_dim,
             qk_rope_head_dim=qk_rope_head_dim, v_head_dim=v_head_dim,
             max_position_embeddings=max_position_embeddings, rope_theta=rope_theta,
-            rope_scaling_factor=rope_scaling_factor, attention_dropout=attention_dropout,
+            rope_scaling_factor=rope_scaling_factor,
+            original_max_position_embeddings=original_max_position_embeddings,
+            mscale=mscale, attention_dropout=attention_dropout,
             layer_idx=layer_idx,
         )
 
@@ -1221,11 +1232,13 @@ class DSASparseAttention(nn.Module):
         if past_key_value is not None:
             cached_kv, _ = past_key_value
             full_kv_compressed = torch.cat([cached_kv, kv_compressed], dim=1)
+            position_offset = cached_kv.shape[1]
         else:
             full_kv_compressed = kv_compressed
+            position_offset = 0
 
         kv_len = full_kv_compressed.shape[1]
-        causal_mask = self._create_causal_mask(seq_len, kv_len, hidden_states.device)
+        causal_mask = self._create_causal_mask(seq_len, kv_len, hidden_states.device, position_offset)
 
         index_scores = self.indexer(q_compressed, full_kv_compressed, causal_mask)
 
@@ -1385,6 +1398,9 @@ class NanoSeekDecoderLayer(nn.Module):
                 max_position_embeddings=config.max_position_embeddings,
                 rope_theta=config.mla.rope_theta,
                 rope_scaling_factor=config.mla.rope_scaling_factor,
+                original_max_position_embeddings=config.mla.original_max_position_embeddings,
+                mscale=config.mla.mscale,
+                attention_dropout=config.attention_dropout,
                 layer_idx=layer_idx, sparse_config=config.sparse,
             )
         else:
@@ -1910,6 +1926,53 @@ def create_nanoseek(config: NanoSeekConfig = None) -> NanoSeekModel:
     if config is None:
         config = get_nanoseek_config()
     return NanoSeekModel(config)
+
+
+def create_mla_from_config(
+    config: NanoSeekConfig,
+    layer_idx: int = 0,
+) -> MultiHeadLatentAttention:
+    """Create an MLA module from a ``NanoSeekConfig``.
+
+    Kept here (in addition to ``model.__init__`` helpers) so tests and
+    external callers importing from ``model.model`` have a stable API.
+    """
+    return MultiHeadLatentAttention(
+        hidden_size=config.hidden_size,
+        num_heads=config.num_heads,
+        q_lora_rank=config.mla.q_lora_rank,
+        kv_lora_rank=config.mla.kv_lora_rank,
+        qk_nope_head_dim=config.mla.qk_nope_head_dim,
+        qk_rope_head_dim=config.mla.qk_rope_head_dim,
+        v_head_dim=config.mla.v_head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        rope_theta=config.mla.rope_theta,
+        rope_scaling_factor=config.mla.rope_scaling_factor,
+        original_max_position_embeddings=config.mla.original_max_position_embeddings,
+        mscale=config.mla.mscale,
+        attention_dropout=config.attention_dropout,
+        layer_idx=layer_idx,
+    )
+
+
+def create_moe_from_config(config: NanoSeekConfig) -> MoE:
+    """Create a MoE module from a ``NanoSeekConfig``.
+
+    Kept here (in addition to ``model.__init__`` helpers) so tests and
+    external callers importing from ``model.model`` have a stable API.
+    """
+    return MoE(
+        dim=config.hidden_size,
+        moe_inter_dim=config.moe.moe_intermediate_size,
+        n_routed_experts=config.moe.n_routed_experts,
+        n_activated_experts=config.moe.num_experts_per_tok,
+        n_shared_experts=config.moe.n_shared_experts,
+        n_expert_groups=config.moe.n_group,
+        n_limited_groups=config.moe.topk_group,
+        score_func=config.moe.scoring_func,
+        route_scale=config.moe.routed_scaling_factor,
+        seq_aux_loss_alpha=config.moe.seq_aux_loss_alpha,
+    )
 
 
 def test_nanoseek():
