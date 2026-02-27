@@ -44,6 +44,10 @@ NanoSeek has a solid architectural foundation implementing all four DeepSeek V3.
 | Safety Evaluation | Basic in Doc 10 | Dedicated refusal accuracy framework | **CRITICAL** | `20` |
 | Experiment Configs | Scattered argparse | YAML schema + reproducibility | **IMPORTANT** | `21` |
 | Pipeline Orchestration | None | End-to-end shell scripts + DAG | **ESSENTIAL** | `22` |
+| Interpretability Framework | None | Hook-based analysis for MLA/MoE/MTP/DSA | **IMPORTANT** | `23` |
+| Mechanistic Interpretability | None | Circuit discovery, SAE, causal analysis | **IMPORTANT** | `24` |
+| Visualization Toolkit | None | Attention, routing, latent space visualizations | **IMPORTANT** | `25` |
+| Interpretability Evaluation | None | Faithfulness metrics, diagnostic reports | **IMPORTANT** | `26` |
 
 ---
 
@@ -80,8 +84,14 @@ NanoSeek has a solid architectural foundation implementing all four DeepSeek V3.
 4. `17_EVAL_GATE_SHIP_REJECT.md` — Ship/reject decision system
 5. `22_END_TO_END_PIPELINE_ORCHESTRATION.md` — Full pipeline orchestration
 
-### Path 5: "I want to understand everything end-to-end"
-Read 00 → 11 → 14 → 01 → 02 → 03 → 04 → 05 → 06 → 12 → 07 → 08 → 15 → 16 → 09 → 10 → 20 → 18 → 17 → 19 → 21 → 22 → 13
+### Path 5: "I want to understand what the model learned (Interpretability)"
+1. `23_INTERPRETABILITY_FRAMEWORK_NANOSEEK.md` — Hook architecture, analysis framework
+2. `24_MECHANISTIC_INTERPRETABILITY_CIRCUITS.md` — Circuit discovery, SAE, causal analysis
+3. `25_ACTIVATION_ATTENTION_VISUALIZATION.md` — Complete visualization toolkit
+4. `26_INTERPRETABILITY_EVALUATION_REPORTING.md` — Metrics, evaluation, diagnostic reports
+
+### Path 6: "I want to understand everything end-to-end"
+Read 00 → 11 → 14 → 01 → 02 → 03 → 04 → 05 → 06 → 12 → 07 → 08 → 15 → 16 → 09 → 10 → 20 → 18 → 17 → 19 → 21 → 22 → 23 → 24 → 25 → 26 → 13
 
 ---
 
@@ -181,14 +191,24 @@ nanoseek/
 │   │   ├── loadgen.py             # Doc 19: Load generator
 │   │   ├── metrics.py             # Doc 19: Perf metrics collection
 │   │   └── report.py              # Doc 19: Report generation
-│   └── configs/
-│       ├── schema.py              # Doc 21: Config validation schemas
-│       ├── loader.py              # Doc 21: Config loading + merging
-│       ├── pretrain.yaml          # Doc 21: Pre-training config
-│       ├── sft.yaml               # Doc 21: SFT config
-│       ├── dpo.yaml               # Doc 21: DPO config
-│       ├── serving.yaml           # Doc 21: Serving config
-│       └── eval.yaml              # Doc 21: Eval config
+│   ├── configs/
+│   │   ├── schema.py              # Doc 21: Config validation schemas
+│   │   ├── loader.py              # Doc 21: Config loading + merging
+│   │   ├── pretrain.yaml          # Doc 21: Pre-training config
+│   │   ├── sft.yaml               # Doc 21: SFT config
+│   │   ├── dpo.yaml               # Doc 21: DPO config
+│   │   ├── serving.yaml           # Doc 21: Serving config
+│   │   └── eval.yaml              # Doc 21: Eval config
+│   └── interpretability/
+│       ├── framework.py           # Doc 23: Core framework + hooks
+│       ├── patching.py            # Doc 24: Activation patching
+│       ├── moe_analysis.py        # Doc 24: Expert specialization
+│       ├── mla_analysis.py        # Doc 24: MLA latent space analysis
+│       ├── sae.py                 # Doc 24: Sparse autoencoders
+│       ├── visualize.py           # Doc 25: Complete visualization toolkit
+│       ├── metrics.py             # Doc 26: Interpretability metrics
+│       ├── report.py              # Doc 26: Diagnostic report generator
+│       └── human_eval.py          # Doc 26: Human evaluation framework
 ├── scripts/
 │   ├── train_sft.sh               # Doc 22: One-command SFT
 │   ├── train_dpo.sh               # Doc 22: One-command DPO
