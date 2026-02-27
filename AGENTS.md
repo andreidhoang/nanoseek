@@ -21,3 +21,4 @@ NanoSeek is a single-package Python ML project (educational DeepSeek V3.2 implem
 - `~/.local/bin` must be on `PATH` for `pytest`, `black`, `isort`, `mypy`, and other pip-installed scripts to be found.
 - No GPU is available in this environment; all tests run on CPU. Tests marked `@pytest.mark.gpu` are automatically skipped.
 - `mypy model/` reports a false positive from torch internals (pattern matching syntax error in `torch._inductor`). This is not a project issue.
+- `pyproject.toml` requires `[tool.setuptools.packages.find]` with `include = ["model*", "scripts*"]` for editable installs to work, because setuptools' flat-layout auto-discovery otherwise picks up `implementation_docs/` and refuses to build.
