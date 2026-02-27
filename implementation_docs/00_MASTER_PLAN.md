@@ -32,6 +32,10 @@ NanoSeek has a solid architectural foundation implementing all four DeepSeek V3.
 | Speculative Decoding | MTP modules exist | Full draft-verify pipeline | **IMPORTANT** | `08` |
 | Post-Training | None | SFT + DPO + RLVR | **CRITICAL** | `09` |
 | Evaluation | Basic loss eval | Full benchmark suite | **IMPORTANT** | `10` |
+| **Forward/Backward Walkthrough** | N/A | End-to-end tensor trace | **ESSENTIAL** | `11` |
+| **Complete Training Step** | N/A | One iteration dissected | **ESSENTIAL** | `12` |
+| **Integration Guide** | N/A | Exact diffs to wire in | **ESSENTIAL** | `13` |
+| **Numerical Stability** | N/A | Init, precision, gradient health | **ESSENTIAL** | `14` |
 
 ---
 
@@ -51,8 +55,15 @@ NanoSeek has a solid architectural foundation implementing all four DeepSeek V3.
 3. `09_POST_TRAINING_SFT_DPO_RLVR.md` — Make it chat-capable
 4. `10_EVALUATION_BENCHMARKS.md` — Measure quality
 
-### Path 3: "I want to understand everything end-to-end"
-Read 00 → 01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10
+### Path 3: "I want to understand the model deeply first"
+1. `11_COMPLETE_FORWARD_BACKWARD_WALKTHROUGH.md` — Trace every tensor through the full model
+2. `12_COMPLETE_TRAINING_STEP.md` — One complete training iteration dissected
+3. `14_WEIGHT_INIT_NUMERICAL_STABILITY.md` — Why training doesn't blow up
+4. Then read component docs (01-10) for production optimizations
+5. `13_PRODUCTION_INTEGRATION_GUIDE.md` — How to wire everything in
+
+### Path 4: "I want to understand everything end-to-end"
+Read 00 → 11 → 14 → 01 → 02 → 03 → 04 → 05 → 06 → 12 → 07 → 08 → 09 → 10 → 13
 
 ---
 
