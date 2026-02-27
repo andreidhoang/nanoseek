@@ -444,7 +444,8 @@ class RefusalDetector:
         if any(first_sentence.lower().startswith(p) for p in apologetic):
             features["refusal_signal"] += 0.5
 
-        if re.search(r"```|step \d|1\.|2\.|3\.", response):
+        backtick_fence = "`" * 3
+        if re.search(backtick_fence + r"|step \d|1\.|2\.|3\.", response):
             features["compliance_signal"] += 0.5
         if re.search(r"\b(instead|alternative|however|rather)\b", response, re.IGNORECASE):
             features["refusal_signal"] += 0.3
