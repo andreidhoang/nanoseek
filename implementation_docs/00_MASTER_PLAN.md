@@ -36,6 +36,14 @@ NanoSeek has a solid architectural foundation implementing all four DeepSeek V3.
 | **Complete Training Step** | N/A | One iteration dissected | **ESSENTIAL** | `12` |
 | **Integration Guide** | N/A | Exact diffs to wire in | **ESSENTIAL** | `13` |
 | **Numerical Stability** | N/A | Init, precision, gradient health | **ESSENTIAL** | `14` |
+| API Server | None | OpenAI-compatible FastAPI + SSE | **CRITICAL** | `15` |
+| Quantization (Serving) | None | INT8/INT4 post-training quantization | **IMPORTANT** | `16` |
+| Eval Gate | None | Ship/reject decision system | **CRITICAL** | `17` |
+| Data Leakage Detection | None | N-gram contamination checking | **CRITICAL** | `18` |
+| Perf Load Testing | None | Load generator + metrics + reports | **IMPORTANT** | `19` |
+| Safety Evaluation | Basic in Doc 10 | Dedicated refusal accuracy framework | **CRITICAL** | `20` |
+| Experiment Configs | Scattered argparse | YAML schema + reproducibility | **IMPORTANT** | `21` |
+| Pipeline Orchestration | None | End-to-end shell scripts + DAG | **ESSENTIAL** | `22` |
 
 ---
 
@@ -52,8 +60,11 @@ NanoSeek has a solid architectural foundation implementing all four DeepSeek V3.
 ### Path 2: "I want to serve this model to users"
 1. `07_INFERENCE_ENGINE.md` — Production serving infrastructure
 2. `08_SPECULATIVE_DECODING_MTP.md` — Fast generation with MTP
-3. `09_POST_TRAINING_SFT_DPO_RLVR.md` — Make it chat-capable
-4. `10_EVALUATION_BENCHMARKS.md` — Measure quality
+3. `15_OPENAI_COMPATIBLE_API_SERVER.md` — FastAPI + SSE streaming API
+4. `16_QUANTIZATION_INT8_INT4_SERVING.md` — INT8/INT4 for efficient serving
+5. `09_POST_TRAINING_SFT_DPO_RLVR.md` — Make it chat-capable
+6. `10_EVALUATION_BENCHMARKS.md` — Measure quality
+7. `19_PERFORMANCE_LOAD_TESTING_HARNESS.md` — Benchmark serving performance
 
 ### Path 3: "I want to understand the model deeply first"
 1. `11_COMPLETE_FORWARD_BACKWARD_WALKTHROUGH.md` — Trace every tensor through the full model
@@ -62,8 +73,15 @@ NanoSeek has a solid architectural foundation implementing all four DeepSeek V3.
 4. Then read component docs (01-10) for production optimizations
 5. `13_PRODUCTION_INTEGRATION_GUIDE.md` — How to wire everything in
 
-### Path 4: "I want to understand everything end-to-end"
-Read 00 → 11 → 14 → 01 → 02 → 03 → 04 → 05 → 06 → 12 → 07 → 08 → 09 → 10 → 13
+### Path 4: "I want to deploy to production (FMS Lab pipeline)"
+1. `21_EXPERIMENT_CONFIGS_REPRODUCIBILITY.md` — Config system for reproducible experiments
+2. `18_DATA_LEAKAGE_CONTAMINATION_DETECTION.md` — Ensure eval integrity
+3. `20_SAFETY_EVALUATION_FRAMEWORK.md` — Safety testing framework
+4. `17_EVAL_GATE_SHIP_REJECT.md` — Ship/reject decision system
+5. `22_END_TO_END_PIPELINE_ORCHESTRATION.md` — Full pipeline orchestration
+
+### Path 5: "I want to understand everything end-to-end"
+Read 00 → 11 → 14 → 01 → 02 → 03 → 04 → 05 → 06 → 12 → 07 → 08 → 15 → 16 → 09 → 10 → 20 → 18 → 17 → 19 → 21 → 22 → 13
 
 ---
 
@@ -151,6 +169,34 @@ nanoseek/
 │   ├── rlvr.py                    # NEW: Doc 09 - RLVR training
 │   ├── evaluate.py                # NEW: Doc 10 - Benchmark runner
 │   └── serve.py                   # NEW: Doc 07 - Serving launcher
+├── fms/                               # NEW: FMS Lab additions (Docs 15-22)
+│   ├── serving/
+│   │   ├── server.py              # Doc 15: FastAPI OpenAI-compatible server
+│   │   └── quantize.py            # Doc 16: INT8/INT4 post-training quantization
+│   ├── eval_harness/
+│   │   ├── gate.py                # Doc 17: Ship/reject decision logic
+│   │   ├── leakage.py             # Doc 18: Data leakage detection
+│   │   └── safety.py              # Doc 20: Safety evaluation framework
+│   ├── perf/
+│   │   ├── loadgen.py             # Doc 19: Load generator
+│   │   ├── metrics.py             # Doc 19: Perf metrics collection
+│   │   └── report.py              # Doc 19: Report generation
+│   └── configs/
+│       ├── schema.py              # Doc 21: Config validation schemas
+│       ├── loader.py              # Doc 21: Config loading + merging
+│       ├── pretrain.yaml          # Doc 21: Pre-training config
+│       ├── sft.yaml               # Doc 21: SFT config
+│       ├── dpo.yaml               # Doc 21: DPO config
+│       ├── serving.yaml           # Doc 21: Serving config
+│       └── eval.yaml              # Doc 21: Eval config
+├── scripts/
+│   ├── train_sft.sh               # Doc 22: One-command SFT
+│   ├── train_dpo.sh               # Doc 22: One-command DPO
+│   ├── serve.sh                   # Doc 22: One-command serving
+│   ├── eval_all.sh                # Doc 22: One-command full eval
+│   ├── gate_check.sh              # Doc 22: One-command gate check
+│   ├── run_pipeline.sh            # Doc 22: Master pipeline script
+│   └── generate_report.py         # Doc 22: Final Table generation
 └── tests/
     ├── test_kernels.py            # NEW: Kernel correctness tests
     ├── test_serving.py            # NEW: Serving tests
