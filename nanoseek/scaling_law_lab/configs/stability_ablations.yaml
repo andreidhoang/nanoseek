@@ -1,0 +1,33 @@
+# Stability Ablations at Anchor Scale
+# 5 runs × ~13 min each = ~1.1 hrs on any 24GB GPU
+# Pre-registered hypotheses in analyze_ablations.py
+
+scale: anchor
+seed: 42
+eval_every: 50   # more frequent eval for stability analysis
+
+runs:
+  stab-A-baseline:
+    # Full V3.2 baseline — all techniques ON
+    # This is the control for all stability comparisons
+    flags: []
+
+  stab-C-no-seq-aux:
+    # Remove sequence-level auxiliary loss
+    # Hypothesis: I_spec drops by >0.1 nats
+    flags: [--no-seq-aux]
+
+  stab-D-no-gradclip:
+    # Remove gradient clipping
+    # Hypothesis: loss spike at step ~500-1000
+    flags: [--no-grad-clip]
+
+  stab-E-classic-aux:
+    # Replace aux-loss-free with classic aux loss (alpha=0.01)
+    # Hypothesis: I_spec drops by >0.1 nats vs bias-based
+    flags: [--aux-loss-type, classic]
+
+  stab-F-bad-batch:
+    # Inject 10× gradient at step 1500
+    # Hypothesis: recovery within 50 steps
+    flags: [--inject-bad-batch, "1500"]

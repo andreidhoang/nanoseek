@@ -120,11 +120,16 @@ RULE 7: Expert routing metrics (H_load + I_spec) must be logged for ALL stabilit
         These are DIFFERENT metrics — H_load measures uniformity, I_spec measures semantic roles.
         Primary scientific output: A vs C I_spec comparison (does aux-loss-free allow more specialization?).
 
-RULE 8: RL post-training uses 3-stage pipeline, not single-stage GRPO.
-        Stage 1: Reasoning RL (GRPO, 60% budget) → Stage 2: Agent RL (GRPO, 25%)
-        → Stage 3: General Alignment (DPO, 15%) → Cross-stage distillation (500 steps).
-        All 4 V3.2 MoE stabilization techniques active in EVERY stage.
-        Keep Routing (Technique 3) is MOST critical in Stage 2 (agent tasks route differently).
+RULE 8: Post-training uses 9-stage, 2-phase pipeline.
+        Phase 1 (NanoSeek-Reason): Stage 0 Teacher Distill → Stage 1 Extended SFT →
+        Stage 2 RLVR (GSPO) → Stage 3 Rejection Sampling → Stage 4 Thinking Fusion →
+        Stage 5 Alignment (DPO) → Cross-stage distill (500 steps).
+        Phase 2 (NanoSeek-Agent): Stage 6 Tool Format SFT → Stage 7 Agentic RL
+        (GRPO + token masking, 50 steps) → Stage 8 Agent Rejection Sampling →
+        Cross-stage distill (300 steps).
+        All 4 V3.2 MoE stabilization techniques active in RL stages (2, 5, 7).
+        Router FROZEN in RL stages, UNFROZEN in SFT stages.
+        H_load + I_spec + MTP at EVERY stage boundary.
 
 RULE 9: MTP acceptance rate is a test-time scaling signal — measure it during RL.
         Track at each stage boundary AND as a function of inference token budget.

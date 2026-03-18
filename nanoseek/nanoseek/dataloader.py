@@ -21,8 +21,8 @@ import random
 import torch
 import pyarrow.parquet as pq
 
-from nanochat.common import get_dist_info
-from nanochat.dataset import list_parquet_files
+from nanoseek.common import get_dist_info
+from nanoseek.dataset import list_parquet_files
 
 
 def fim_transform(tokens, fim_rate, fim_tokens, rng):
@@ -129,6 +129,15 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     use_fim = fim_rate > 0 and split == "train"
     fim_tokens = tokenizer.get_fim_tokens() if use_fim else None
     fim_rng = random.Random(42)  # deterministic FIM decisions
+    # Restore FIM RNG state from checkpoint (if available) so that
+    # FIM decisions after resume match what they would have been
+    # in a continuous run. Without this, the RNG resets to seed 42
+    # on every resume, breaking ablation reproducibility.
+    if resume_state_dict is not None and "fim_rng_state" in resume_state_dict:
+        fim_rng.setstate(tuple(
+            tuple(x) if isinstance(x, list) else x
+            for x in resume_state_dict["fim_rng_state"]
+        ))
     fim_count = 0  # running count of FIM-transformed docs
     total_count = 0  # running count of all docs
 
@@ -190,8 +199,16 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
 
+        # Save FIM RNG state so it can be restored on resume.
+        # random.getstate() returns (version, internalstate, gauss_next) —
+        # all JSON-serializable (ints, tuples of ints, float).
+        fim_rng_state = list(fim_rng.getstate()) if use_fim else None
+        # Convert internal state tuple to list for JSON serialization
+        if fim_rng_state is not None:
+            fim_rng_state[1] = list(fim_rng_state[1])
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch,
-                      "fim_fraction": fim_count / max(total_count, 1)}
+                      "fim_fraction": fim_count / max(total_count, 1),
+                      "fim_rng_state": fim_rng_state}
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)

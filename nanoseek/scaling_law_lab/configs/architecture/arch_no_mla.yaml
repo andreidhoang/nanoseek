@@ -1,0 +1,20 @@
+# ============================================================================
+# Architecture Ablation: Standard MHA (No MLA)
+# ============================================================================
+# STATUS: NOT YET IMPLEMENTABLE
+#
+# This ablation requires implementing a StandardMultiHeadAttention module
+# in model.py as an alternative to MultiHeadLatentAttention.
+#
+# Pre-registered hypothesis:
+#   Loss approximately equal (MLA saves KV cache, not training quality at 4K).
+#   MLA's value is inference efficiency, not training signal.
+#
+# TODO: Implement StandardMHA module with same interface as MLA, then add
+#       a config flag (e.g., config.use_mla = True/False) to switch.
+#
+# This is Phase 2 work — not blocking Day 1 ablations.
+# ============================================================================
+
+# PLACEHOLDER — requires model.py changes
+# use_mla: false

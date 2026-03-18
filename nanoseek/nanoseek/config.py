@@ -5,9 +5,9 @@
 #
 # PRIMARY CONFIG: NanoSeek-1B
 # =============================
-# - Active parameters: ~1.08B (embeddings + MLA + shared + 8 routed experts)
-# - Total parameters: ~4.87B (all 64 routed experts)
-# - Expansion ratio: 4.5× (total/active)
+# - Active parameters: ~1.13B (embeddings + MLA + shared + 8 routed experts)
+# - Total parameters: ~4.9B (all 64 routed experts)
+# - Expansion ratio: ~4.3× (total/active)
 # - Training: 22B tokens (~20× active params, Chinchilla optimal)
 # - Hardware: 8×H100, ~14 hours, ~$275-350
 
@@ -255,11 +255,12 @@ class MLAConfig:
     # This is the key parameter for KV cache reduction
     kv_lora_rank: int = 143
 
-    # Head dimensions for hidden=2048, num_heads=16 (head_dim=128)
-    # Ratio: qk_nope:qk_rope:v = 2:1:2 (scaled for larger head_dim)
-    qk_nope_head_dim: int = 64   # Non-positional component
-    qk_rope_head_dim: int = 32   # RoPE component (SHARED across heads!)
-    v_head_dim: int = 64         # Value dimension
+    # Head dimensions — FIXED CONSTANTS across all model sizes (DeepSeek family invariant)
+    # V2-Lite (2048h), V2 (5120h), V3 (7168h) all use identical 128/64/128
+    # These are NOT ratios of hidden_size — they are absolute architectural constants
+    qk_nope_head_dim: int = 128  # Non-positional component (DeepSeek V2/V2-Lite/V3: 128)
+    qk_rope_head_dim: int = 64   # RoPE component, SHARED across heads (DeepSeek: 64)
+    v_head_dim: int = 128        # Value dimension (DeepSeek V2/V2-Lite/V3: 128)
 
     # RoPE configuration
     rope_theta: float = 10000.0
@@ -286,8 +287,8 @@ class MLAConfig:
 
         Example for NanoSeek-1B (hidden=2048, num_heads=16):
         - Standard: 2 * 16 * 128 = 4096
-        - MLA: 143 + 32 = 175
-        - Compression: ~23x
+        - MLA: 143 + 64 = 207
+        - Compression: ~20x
         """
         return self.kv_lora_rank + self.qk_rope_head_dim
 
@@ -327,7 +328,7 @@ class MoEConfig:
 
     # Scoring function
     scoring_func: Literal["sigmoid", "softmax"] = "sigmoid"
-    routed_scaling_factor: float = 2.5   # Scale expert outputs (sqrt(8) ≈ 2.83)
+    routed_scaling_factor: float = 2.5   # DeepSeek V3 empirical value (NOT sqrt(K)=2.83)
     
     # Top-k probability normalization (CRITICAL BUG FIX)
     # Must be applied in Gate.forward() after top-k selection:
@@ -348,8 +349,11 @@ class MoEConfig:
     # 2. Sequence-level: Small auxiliary loss (V3 addition)
     seq_aux_loss_alpha: float = 0.0001   # Very small! (V3 default)
 
+    # Ablation flags
+    disable_shared_experts: bool = False  # Ablation: zero out shared expert output
+
     # Which layers use MoE (layers before this use dense FFN)
-    first_k_dense_replace: int = 2       # Layers 0-(k-1) use dense FFN
+    first_k_dense_replace: int = 1       # Layer 0 uses dense FFN (V2-Lite precedent at this scale)
 
     @property
     def experts_per_group(self) -> int:
@@ -537,7 +541,7 @@ class NanoSeekConfig:
 
     # Logit softcap — tanh squash to [-cap, cap] before CE loss
     # Prevents logit explosion from MoE expert specialization (Gemma 2 technique)
-    logit_softcap: float = 15.0
+    logit_softcap: float = 30.0
 
     # ========================================================================
     # Component Configurations
@@ -802,12 +806,12 @@ class NanoSeekConfig:
         assert self.mla.qk_rope_head_dim % 2 == 0, \
             f"qk_rope_head_dim ({self.mla.qk_rope_head_dim}) must be even for RoPE"
 
-        # Validate MLA head dimensions are reasonable
+        # Validate MLA head dimensions are positive and even for RoPE
+        # Note: qk_nope/qk_rope/v are model-independent constants (128/64/128)
+        # following the DeepSeek family invariant, so they may exceed head_dim
         mla_q_head_dim = self.mla.qk_nope_head_dim + self.mla.qk_rope_head_dim
-        assert mla_q_head_dim <= head_dim * 2, \
-            f"MLA q_head_dim ({mla_q_head_dim}) seems too large for head_dim ({head_dim})"
-        assert self.mla.v_head_dim <= head_dim * 2, \
-            f"MLA v_head_dim ({self.mla.v_head_dim}) seems too large for head_dim ({head_dim})"
+        assert mla_q_head_dim > 0, "MLA q_head_dim must be positive"
+        assert self.mla.v_head_dim > 0, "MLA v_head_dim must be positive"
 
         # Validate LoRA ranks are reasonable fractions of hidden_size
         assert self.mla.q_lora_rank <= self.hidden_size, \
@@ -1015,9 +1019,9 @@ def get_nanoseek_config() -> NanoSeekConfig:
         mla=MLAConfig(
             q_lora_rank=440,           # 0.215 × 2048 = 440 (muP ratio must match anchor/500M)
             kv_lora_rank=143,          # 0.07 × 2048 = 143 ✓
-            qk_nope_head_dim=64,       # Larger for 128 head_dim
-            qk_rope_head_dim=32,       # Half of nope (2:1 ratio)
-            v_head_dim=64,             # Same as qk_nope
+            qk_nope_head_dim=128,      # DeepSeek family constant (V2-Lite/V2/V3 all use 128)
+            qk_rope_head_dim=64,       # DeepSeek family constant (all use 64)
+            v_head_dim=128,            # DeepSeek family constant (all use 128)
             rope_theta=10000.0,
             original_max_position_embeddings=4096,
         ),
@@ -1037,7 +1041,7 @@ def get_nanoseek_config() -> NanoSeekConfig:
             n_group=8,                   # 8 experts per group (64/8)
             topk_group=4,                # Route to half the groups
             scoring_func="sigmoid",      # DeepSeek V3 innovation
-            routed_scaling_factor=2.83,  # sqrt(8) ≈ 2.83 — must match anchor/500M for muP transfer
+            routed_scaling_factor=2.5,   # DeepSeek V3 empirical value (NOT sqrt(K)=2.83)
             norm_topk_prob=True,
 
             # Load balancing (DeepSeek V3 aux-loss-free)
@@ -1045,8 +1049,8 @@ def get_nanoseek_config() -> NanoSeekConfig:
             gamma_freeze_ratio=0.95,     # V3: 14.3T/14.8T ≈ 0.966 → 0.95 conservative
             seq_aux_loss_alpha=0.0001,   # Very small sequence-level aux loss
 
-            # First 2 layers use dense FFN (DeepSeek pattern)
-            first_k_dense_replace=2,
+            # First layer uses dense FFN (V2-Lite precedent at comparable scale)
+            first_k_dense_replace=1,
         ),
 
         # ====================================================================
@@ -1169,9 +1173,9 @@ def get_nanoseek_500m_config() -> NanoSeekConfig:
         mla=MLAConfig(
             q_lora_rank=275,           # 0.215 × 1280 = 275 ✓
             kv_lora_rank=90,           # 0.070 × 1280 = 90 ✓
-            qk_nope_head_dim=48,       # Scaled for 128 head_dim
-            qk_rope_head_dim=24,       # Must be even for RoPE
-            v_head_dim=48,             # Same as qk_nope
+            qk_nope_head_dim=128,      # DeepSeek family constant (V2-Lite/V2/V3 all use 128)
+            qk_rope_head_dim=64,       # DeepSeek family constant (all use 64)
+            v_head_dim=128,            # DeepSeek family constant (all use 128)
             rope_theta=10000.0,
             original_max_position_embeddings=4096,
         ),
@@ -1191,7 +1195,7 @@ def get_nanoseek_500m_config() -> NanoSeekConfig:
             n_group=8,                   # 8 experts per group (64/8)
             topk_group=4,                # Route to half the groups
             scoring_func="sigmoid",      # DeepSeek V3 innovation
-            routed_scaling_factor=2.83,  # sqrt(8) ≈ 2.83
+            routed_scaling_factor=2.5,   # DeepSeek V3 empirical value (NOT sqrt(K)=2.83)
             norm_topk_prob=True,
 
             # Load balancing (DeepSeek V3 aux-loss-free)
@@ -1199,8 +1203,8 @@ def get_nanoseek_500m_config() -> NanoSeekConfig:
             gamma_freeze_ratio=0.95,     # V3: 14.3T/14.8T ≈ 0.966 → 0.95 conservative
             seq_aux_loss_alpha=0.0001,
 
-            # First 2 layers use dense FFN (same pattern as 1B)
-            first_k_dense_replace=2,
+            # First layer uses dense FFN (V2-Lite precedent at comparable scale)
+            first_k_dense_replace=1,
         ),
 
         # ====================================================================
@@ -1315,9 +1319,9 @@ def get_nanoseek_anchor_config() -> NanoSeekConfig:
         mla=MLAConfig(
             q_lora_rank=103,           # 0.215 × 480 = 103
             kv_lora_rank=34,           # 0.070 × 480 = 34
-            qk_nope_head_dim=32,       # Scaled for 80 head_dim
-            qk_rope_head_dim=16,       # Must be even for RoPE
-            v_head_dim=32,             # Same as qk_nope
+            qk_nope_head_dim=128,      # DeepSeek family constant (V2-Lite/V2/V3 all use 128)
+            qk_rope_head_dim=64,       # DeepSeek family constant (all use 64)
+            v_head_dim=128,            # DeepSeek family constant (all use 128)
             rope_theta=10000.0,
             original_max_position_embeddings=4096,
         ),
@@ -1335,7 +1339,7 @@ def get_nanoseek_anchor_config() -> NanoSeekConfig:
             n_group=8,
             topk_group=4,
             scoring_func="sigmoid",
-            routed_scaling_factor=2.83,  # sqrt(8)
+            routed_scaling_factor=2.5,   # DeepSeek V3 empirical value (NOT sqrt(K)=2.83)
             norm_topk_prob=True,
 
             # Load balancing
@@ -1343,8 +1347,8 @@ def get_nanoseek_anchor_config() -> NanoSeekConfig:
             gamma_freeze_ratio=0.95,     # RULE 2: always 0.95
             seq_aux_loss_alpha=0.0001,
 
-            # First 2 layers use dense FFN
-            first_k_dense_replace=2,
+            # First layer uses dense FFN (V2-Lite precedent)
+            first_k_dense_replace=1,
         ),
 
         # ====================================================================

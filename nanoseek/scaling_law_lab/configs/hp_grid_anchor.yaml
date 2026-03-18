@@ -1,0 +1,19 @@
+# HP Grid Search at Anchor Scale (~55M active)
+# 12 combinations: matrix_lr × {0.005, 0.01, 0.02, 0.04} × embedding_lr × {0.1, 0.3, 0.5}
+# GPU: 1× A6000, ~13 min each, total ~2.6 hrs, ~$8.55
+# Pre-registered: best HP here should transfer via muP to 500M within 0.02 BPB
+
+scale: anchor
+seed: 42
+eval_every: 100
+save_every: -1  # no checkpoints for grid search (save GPU time + disk)
+
+grid:
+  matrix_lr: [0.005, 0.01, 0.02, 0.04]
+  embedding_lr: [0.1, 0.3, 0.5]
+
+# Fixed parameters (not swept)
+unembedding_lr: 0.008
+router_lr: 0.0003
+norm_lr: 0.0003
+weight_decay: 0.1

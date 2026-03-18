@@ -1,0 +1,22 @@
+# ============================================================================
+# Stability Ablation A — Full V3.2 Baseline
+# ============================================================================
+# All DeepSeek V3.2 stabilization techniques ON.
+# This is the CONTROL run for all stability ablations.
+#
+# Techniques active:
+#   - Aux-loss-free bias-based balancing (gamma=0.001)
+#   - Sequence auxiliary loss (alpha=0.0001)
+#   - Gamma freeze at 95% of training
+#   - Gradient clipping (max_norm=1.0)
+#
+# Launch:
+#   python -m nanoseek.scripts.pre_train \
+#       --run "stab-A-baseline" \
+#       --scale anchor \
+#       --config-yaml scaling_law_lab/configs/stability/stab_A_baseline.yaml \
+#       --seed 42
+# ============================================================================
+
+# No overrides needed — default config IS the baseline.
+# This file exists for documentation and the YAML runner.

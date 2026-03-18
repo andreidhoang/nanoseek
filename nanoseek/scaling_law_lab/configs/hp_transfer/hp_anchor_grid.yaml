@@ -1,0 +1,33 @@
+# ============================================================================
+# HP Grid Search — Anchor Scale (12 runs)
+# ============================================================================
+# Purpose: Find optimal (matrix_lr, embedding_lr) at anchor width=480.
+# These HPs transfer to 500M/1B via muP scaling rules.
+#
+# Pre-registered hypothesis:
+#   matrix_lr=0.02, embedding_lr=0.3 are near-optimal at anchor.
+#   muP-scaled to 500M achieves ema_val_bpb within 0.02 of 500M grid optimum.
+#
+# Launch:
+#   for mlr in 0.005 0.01 0.02 0.04; do
+#     for elr in 0.1 0.3 0.5; do
+#       python -m nanoseek.scripts.pre_train \
+#           --run "hp-anchor-mlr${mlr}-elr${elr}" \
+#           --scale anchor \
+#           --matrix-lr $mlr \
+#           --embedding-lr $elr \
+#           --eval-every 100 \
+#           --save-every -1 \
+#           --seed 42
+#     done
+#   done
+# ============================================================================
+
+scale: anchor
+seed: 42
+eval_every: 100
+save_every: -1
+
+grid:
+  matrix_lr: [0.005, 0.01, 0.02, 0.04]
+  embedding_lr: [0.1, 0.3, 0.5]

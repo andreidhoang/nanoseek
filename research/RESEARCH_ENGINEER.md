@@ -2,7 +2,7 @@
 
 **A complete account of why every major decision was made, what research it rests on, and what the project ultimately aims to prove.**
 
-*Last updated: 2026-03-13*
+*Last updated: 2026-03-18*
 
 ---
 
@@ -21,6 +21,9 @@
 11. [Risk Register: What Could Fail](#11-risk-register-what-could-fail)
 12. [What "Done" Looks Like](#12-what-done-looks-like)
 13. [Complete Citation List](#13-complete-citation-list)
+14. [Modern Training Techniques](#14-modern-training-techniques-nanochat-derived)
+15. [Tokenizer Strategy](#15-tokenizer-strategy-32k-vocab-for-nano-scale-moe)
+16. [Architecture & Hyperparameter Audit (2026-03-18)](#16-architecture--hyperparameter-audit-2026-03-18)
 
 ---
 
@@ -34,7 +37,7 @@ Modern frontier MoE models (DeepSeek V3, Mixtral, GPT-4) demonstrate that sparse
 
 3. **A complete, educational implementation** of DeepSeek V3's innovations (MLA, auxiliary-loss-free routing, MTP, DSA) that a single researcher can understand, train, and experiment with.
 
-NanoSeek addresses all three by building a 1.08B-active / 4.75B-total MoE from first principles, with every design choice traceable to a specific paper and derivation.
+NanoSeek addresses all three by building a ~1.13B-active / ~4.9B-total MoE from first principles, with every design choice traceable to a specific paper and derivation.
 
 ---
 
@@ -364,9 +367,10 @@ This dominates inference memory at long contexts.
 Compress KV into a single low-rank vector:
 ```
 kv_lora_rank = 143 (vs 4096 for standard)
-Compression = 4096 / 143 ≈ 23×
+Actual KV cache per token = kv_lora_rank + qk_rope_head_dim = 143 + 64 = 207
+Compression = 4096 / 207 ≈ 20×
 
-MLA KV cache = 16 × 8192 × 143 × 2 = 37 MB  (vs 1.07 GB)
+MLA KV cache = 16 × 8192 × 207 × 2 = 54 MB  (vs 1.07 GB)
 ```
 
 The key insight from DeepSeek V3: the compressed representation c_t is a shared "latent" that is expanded via learned projections into keys and values at inference time. Training learns what to compress.
@@ -423,8 +427,8 @@ Constants across all three:
 - κ = 12.5%
 - moe_inter/hidden = 0.375
 - n_shared_experts = 2
-- MLA ratios (q_lora/h, kv_lora/h)
-- Head dimension structure (qk_nope:qk_rope:v = 3:1:3)
+- MLA compression ratios (q_lora/h=0.215, kv_lora/h=0.070)
+- MLA head dims: qk_nope=128, qk_rope=64, v=128 (fixed constants, not ratios)
 
 **Success criterion:** nano-500M trains to reasonable ema_val_bpb using auto-scaled HPs from anchor, without manual tuning. If manual tuning is needed, we document which scaling rule broke and why.
 
@@ -610,7 +614,7 @@ One of this project's principles is intellectual honesty about the source of eac
 | Load balancing | Aux-loss-free bias adjustment, γ=0.001 | High — principled advantage over aux-loss |
 | MTP | Multi-token prediction with k=1 additional head | Medium — beneficial but λ schedule is our choice |
 | DSA | Dynamic sparse attention concept and indexer design | Medium — adapted for our scale |
-| First-2-dense | First k layers use dense FFN instead of MoE | Medium — heuristic, not deeply ablated |
+| First-1-dense | First layer uses dense FFN instead of MoE (V2-Lite precedent) | Medium — heuristic, reduced from 2→1 per V2-Lite at comparable scale |
 | top-8 activation | k=8 experts per token | High — same as V3, though κ differs |
 | CPU-side EMA | EMA weights offloaded to CPU RAM, updated asynchronously | High — same design principle at 671B |
 
@@ -830,23 +834,23 @@ Five techniques adapted from nanochat/gpt.py (Karpathy's training codebase) afte
 
 **muP compatibility**: Transparent — muP scaling factors apply to optimizer LR, not to the Linear forward. CastLinear doesn't change the mathematical operation, only the precision path.
 
-### 14.2 Zero-Init Output Projections
+### 14.2 Small-Scale Init for Output Projections
 
-**What**: Initialize `wo.weight` (attention output), `w_down.weight` (FFN/expert output), and `concat_proj.weight` (MTP fusion) to zeros. Every other weight uses normal init.
+**What**: Initialize `wo.weight` (attention output), `w_down.weight` (FFN/expert output) with N(0, σ=0.006). Initialize `concat_proj.weight` (MTP fusion) to zeros (MTP heads should start as identity). Every other weight uses width-dependent init N(0, 1/√hidden_size).
 
-**Why**: At initialization, each transformer block becomes an identity function (residual + 0 = residual). This is especially critical for MoE: without zero-init, you have random routing (router is untrained) selecting random experts whose random projections perturb the residual stream — double randomness that can cause early training instability. Zero-init means the model starts as an embedding → norm → lm_head pipeline, and experts "fade in" as training progresses.
+**Why**: At initialization, each transformer block should contribute minimally to the residual stream. This is especially critical for MoE: without small-scale init, you have random routing (router is untrained) selecting random experts whose random projections perturb the residual stream — double randomness that can cause early training instability. Small-scale init means the model starts approximately as an embedding → norm → lm_head pipeline, and experts "fade in" as training progresses.
 
-**Provenance**: GPT-2 (Radford et al., 2019) used scaled residual init; nanochat/gpt.py lines 223–225 uses explicit zero-init. The MoE justification follows from DeepSeek V3's analysis of expert load collapse in early training.
+**Provenance**: DeepSeek V3 Technical Report: *"All learnable parameters are randomly initialized with a standard deviation of 0.006."* This is a flat constant — no layer-dependent scaling (the earlier `0.006/√(2*n_layers)` GPT-2/GPT-3 pattern was incorrect for this architecture). The flat σ=0.006 provides sufficient gradient signal to the router at init while keeping output projections near-identity.
 
-**muP compatibility**: Zero-init is a constant initializer, so it composes with muP's per-layer LR scaling — the optimizer will grow these weights from zero at the muP-prescribed rate.
+**muP compatibility**: The flat σ=0.006 is a constant initializer independent of width, so it composes cleanly with muP's per-layer LR scaling. The same σ is used at anchor (480h), 500M (1280h), and 1B (2048h) scales.
 
 ### 14.3 Logit Softcap
 
-**What**: After `lm_head`, apply `cap × tanh(logits / cap)` with `cap = 15.0`, computed in fp32. This squashes logits to [−15, 15] with a smooth tanh boundary.
+**What**: After `lm_head`, apply `cap × tanh(logits / cap)` with `cap = 30.0`, computed in fp32. This squashes logits to [−30, 30] with a smooth tanh boundary.
 
 **Why**: MoE expert specialization can cause logit explosion — when a subset of experts becomes highly confident on certain tokens, their concentrated output through `lm_head` produces extreme logits. Unlike simple clipping, tanh softcap has smooth gradients everywhere (no gradient discontinuity at the boundary), so it doesn't interfere with learning. The fp32 upcast prevents bf16 overflow in the tanh computation.
 
-**Provenance**: Gemma 2 (Google DeepMind, 2024). nanochat/gpt.py lines 421–425. Cap value of 15.0 is empirically standard — large enough not to constrain normal logits (typical range ±5–8) but small enough to prevent explosion.
+**Provenance**: Gemma 2 (Google DeepMind, 2024) uses 30.0 for final logits, 50.0 for attention. nanochat/gpt.py lines 421–425. DeepSeek V3 does not use logit softcapping at all. Cap value of 30.0 provides ample headroom for confident predictions (logits of 10-12 needed for 99% confidence on 32K vocab) while still preventing explosion.
 
 **muP compatibility**: Logit softcap acts after the forward pass, before loss. muP doesn't prescribe logit scaling (it scales learning rates and init), so there's no interference.
 
@@ -866,7 +870,7 @@ Five techniques adapted from nanochat/gpt.py (Karpathy's training codebase) afte
 
 **Why**: The variance-preserving principle: if input has unit variance and weights are N(0, 1/√fan_in), the output also has approximately unit variance. With fixed `std = 0.02`, the mismatch is width-dependent: at anchor scale (hidden=480), `1/√480 ≈ 0.0456` vs `0.02` — a 2.3× gap. At 1B scale (hidden=2048), `1/√2048 ≈ 0.0221` vs `0.02` — nearly matched. This means fixed init works differently at different scales, which is exactly what muP transfer wants to avoid. Width-dependent init makes the activation scale consistent across all widths.
 
-**Provenance**: GPT-3 (Brown et al., 2020) used `1/√(2·n_layers·hidden)` for residual projections. nanochat/gpt.py lines 217–224. We use the simpler `1/√hidden_size` combined with zero-init output projections (which handles the depth scaling).
+**Provenance**: GPT-3 (Brown et al., 2020) used `1/√(2·n_layers·hidden)` for residual projections. nanochat/gpt.py lines 217–224. We use `1/√hidden_size` for general weights combined with DeepSeek V3's flat σ=0.006 for output projections (which replaces the depth-scaled pattern).
 
 **muP compatibility**: Strongly positive. muP's width scaling rule `η ∝ 1/width` for hidden weights assumes variance-preserving init. Fixed `std = 0.02` violates this assumption at non-target widths. Width-dependent init means the anchor, 500M, and 1B configs all start with the same activation dynamics, making muP transfer more reliable.
 
@@ -875,12 +879,12 @@ Five techniques adapted from nanochat/gpt.py (Karpathy's training codebase) afte
 | Technique | Failure mode addressed | Interacts with |
 |-----------|----------------------|----------------|
 | CastLinear | Autocast overhead, optimizer precision | None (transparent) |
-| Zero-init outputs | MoE double-random perturbation at init | Width-dependent init (complementary) |
+| Small-scale init (σ=0.006) | MoE double-random perturbation at init | Width-dependent init (complementary) |
 | Logit softcap | MoE expert specialization → logit explosion | None (post-forward) |
 | Post-embedding norm | Width-dependent embedding magnitude | Width-dependent init (complementary) |
 | Width-dependent init | Scale-dependent activation dynamics | muP transfer (enabling) |
 
-The five techniques compose cleanly: CastLinear and logit softcap are isolated (precision path and post-forward respectively). Zero-init + width-dependent init are complementary (zero-init handles output projections, width-dependent init handles everything else). Post-embedding norm + width-dependent init both serve scale-consistency but at different points (embedding output vs all weights).
+The five techniques compose cleanly: CastLinear and logit softcap are isolated (precision path and post-forward respectively). Small-scale init (σ=0.006) + width-dependent init are complementary (small-scale handles output projections, width-dependent handles everything else). Post-embedding norm + width-dependent init both serve scale-consistency but at different points (embedding output vs all weights).
 
 ---
 
@@ -926,6 +930,93 @@ At 16K vocab, bytes-per-token would drop below 2.5, meaning 22B tokens covers le
 - **Split pattern**: nanochat/tokenizer.py (Karpathy), validated in nanochat/dev/LOG.md
 - **Vocab padding**: nanochat/gpt.py lines 168-170 (pad to multiple of 64, slice in forward)
 - **BPE architecture**: GPT-4 style with byte fallback (Radford et al., 2019)
+
+---
+
+## 16. Architecture & Hyperparameter Audit (2026-03-18)
+
+A systematic cross-reference of every NanoSeek hyperparameter against published DeepSeek configs (V2-Lite, V2, V3 on HuggingFace), OLMoE, and Gemma 2. Five errors were identified and corrected.
+
+### 16.1 MLA Head Dimensions Are Fixed Constants, Not Ratios
+
+**Error**: Head dims were scaled proportionally with hidden_size (anchor: 32/16/32, 500M: 48/24/48, 1B: 64/32/64), treating them as ratios of head_dim.
+
+**Correction**: All three configs now use `qk_nope=128, qk_rope=64, v=128` — identical to every model in the DeepSeek family.
+
+**Evidence**: DeepSeek V2-Lite (hidden=2048, 16 heads — identical to NanoSeek-1B) uses 128/64/128. DeepSeek V2 (hidden=5120, 128 heads) uses 128/64/128. DeepSeek V3 (hidden=7168, 128 heads) uses 128/64/128. These are architectural constants, not functions of model width.
+
+**Why it matters**: With the old 64/32/64 at 1B scale, the effective query dimension was 96 (qk_nope + qk_rope) and value dimension was 64. Standard MHA at this scale uses head_dim=128 for both. NanoSeek's MLA was *less expressive than standard MHA per head* — the opposite of MLA's design intent. The new 128/64/128 gives query dimension 192 and value dimension 128, properly exceeding MHA expressiveness.
+
+**Impact**: Active params ~1.08B → ~1.13B (+5%). KV cache per layer: 175 → 207 dims (compression: 23× → 20×, still excellent). For muP transfer: these dims are model-independent constants — same 128/64/128 at anchor, 500M, and 1B.
+
+### 16.2 routed_scaling_factor: sqrt(K) Was Wrong
+
+**Error**: All three configs used `routed_scaling_factor=2.83` (sqrt(8)), justified by an independence assumption (sqrt of number of active experts).
+
+**Correction**: Changed to `2.5` in all three configs.
+
+**Evidence**: DeepSeek V3's published HuggingFace config specifies `routed_scaling_factor: 2.5`, not sqrt(K). The sqrt(K) reasoning assumes independent expert contributions with equal weight, but sigmoid scoring + norm_topk_prob creates a different weight distribution. DeepSeek determined 2.5 empirically after training at 671B scale.
+
+**Impact**: 2.83 over-scaled expert outputs by ~13% relative to shared experts, shifting the effective contribution ratio. The correction aligns with V3's validated value.
+
+### 16.3 Weight Init: Layer-Scaled → Flat σ=0.006
+
+**Error**: Output projections used `σ = 0.006 / √(2 × n_layers)`, giving σ=0.00106 for 16 layers. This is the GPT-2/GPT-3 residual stream pattern.
+
+**Correction**: Flat `σ = 0.006` (no layer scaling).
+
+**Evidence**: DeepSeek V3 Technical Report: *"All learnable parameters are randomly initialized with a standard deviation of 0.006."* No layer-dependent scaling. The `/√(2*n_layers)` pattern is for zero-init + layer scaling architectures, which is not applicable here because:
+1. V3 uses flat init, not zero-init
+2. The small-scale init already serves the "near-identity" purpose
+3. σ=0.00106 is 5.7× smaller than V3's 0.006, potentially under-powering gradient signal to the router at initialization
+
+**Impact**: Stronger initial gradient signal to router → faster expert differentiation in early training.
+
+### 16.4 first_k_dense_replace: 2 → 1
+
+**Error**: 2 dense layers out of 16 (12.5% dense), which is 3× higher than any DeepSeek model.
+
+**Correction**: 1 dense layer (6.25% dense).
+
+**Evidence**: V2-Lite at comparable scale (2.4B active, 27 layers) uses 1 dense layer (3.7%). V3 uses 3/61 (4.9%). V2 uses 1/60 (1.7%). NanoSeek's 2/16 was an outlier. Reducing to 1 frees layer 1 for MoE, adding expert capacity.
+
+**Trade-off accepted**: The first dense layer handles input-adjacent representations. 1 is sufficient for this at 16 layers. V2-Lite validates this at our exact scale.
+
+### 16.5 logit_softcap: 15.0 → 30.0
+
+**Error**: Cap of 15.0 was overly aggressive — it clips logits to [-15, 15] via tanh.
+
+**Correction**: Changed to 30.0 (Gemma 2's published value for final logits).
+
+**Evidence**: DeepSeek V3 does not use logit softcapping at all. Gemma 2 uses 30.0 for final logits and 50.0 for attention logits. For a 32K vocab, achieving 99% confidence on a single token requires logits of ~10-12. A cap of 15.0 was borderline; 30.0 gives ample headroom while still preventing explosion.
+
+**Ablation recommendation**: At anchor scale, compare training with logit_softcap=0 (off, V3 style) vs 30.0 (Gemma 2 style). The winner should be used for the 1B run.
+
+### 16.6 What Was NOT Changed (and Why)
+
+The audit confirmed these are correct:
+
+| Parameter | Value | Why Correct |
+|-----------|-------|-------------|
+| hidden=2048, layers=16 (d/L=128) | OLMoE-1B, LLaMA 3.2 1B exact match | Validated at this scale |
+| E=64, K=8 (κ=12.5%) | OLMoE-1B config | Validated at this exact scale |
+| G≈29, moe_inter=768 | Krajewski optimal 16-32 | Forward derivation is clean |
+| n_shared_experts=2 | DeepSeekMoE small-scale precedent | Documented hypothesis |
+| vocab=32K | Embedding tax 14.2% | 128K would be 48% at 1B |
+| WSD schedule (70% constant) | V3: 67% | Within consensus range |
+| MTP λ=0.3→0.1 at 60% | V3: 0.3→0.1 at 67% | Close match |
+| β₂=0.95, grad_clip=1.0 | V3 spec | Standard for MoE |
+| 22B tokens (20:1) | Chinchilla optimal for active params | Correct for research |
+| Muon + AdamW | Validated for MoE ≤200M (arXiv:2509.24406) | No routing issues reported |
+
+### 16.7 IsoFLOP Consistency Check
+
+For C = 6 × 1.13B × 22B = 1.49 × 10²⁰ FLOPs:
+- Chinchilla optimal N* ≈ √(C / 120) ≈ 1.11B ✓ (close to 1.13B)
+- Krajewski MoE optimal G at 10²⁰: 16-32 → G≈29 ✓
+- Token budget D* ≈ C / (6 × N) = 1.49e20 / (6 × 1.13e9) ≈ 22.0B ✓
+
+The model size, granularity, and token budget remain self-consistent on the isoFLOP curve after these corrections.
 
 ---
 

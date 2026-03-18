@@ -54,7 +54,10 @@ from nanoseek.nanoseek.dataloader import (
     tokenizing_distributed_data_loader_bos_bestfit,
     tokenizing_distributed_data_loader_with_state_bos_bestfit,
 )
-from nanoseek.nanoseek.checkpoint_manager import save_checkpoint, load_checkpoint, load_optimizer_checkpoint, load_ema_checkpoint
+from nanoseek.nanoseek.checkpoint_manager import (
+    save_checkpoint, load_checkpoint, load_optimizer_checkpoint,
+    load_ema_checkpoint, CheckpointManager,
+)
 
 # Eval modules (RULE 7: H_load + I_spec; RULE 9: MTP acceptance rate)
 from nanoseek.eval.information_metrics import compute_i_spec
@@ -120,8 +123,62 @@ parser.add_argument("--ema-every", type=int, default=10,
 parser.add_argument("--resume-from-step", type=int, default=-1,
                 help="resume from checkpoint at this step")
 
+# Reproducibility
+parser.add_argument("--seed", type=int, default=42,
+                    help="random seed for reproducibility")
+
+# ─── Ablation flags (Phase 3 stability & architecture experiments) ───
+parser.add_argument("--no-seq-aux", action="store_true",
+                    help="Ablation: disable sequence-level auxiliary loss (set alpha=0)")
+parser.add_argument("--no-grad-clip", action="store_true",
+                    help="Ablation: disable gradient clipping (set max_norm=inf)")
+parser.add_argument("--aux-loss-type", type=str, default="bias",
+                    choices=["bias", "classic"],
+                    help="Ablation: 'bias' = aux-loss-free balancing (V3), "
+                         "'classic' = traditional aux loss (alpha=0.01)")
+parser.add_argument("--no-mtp", action="store_true",
+                    help="Ablation: disable MTP (set lambda=0 throughout training)")
+parser.add_argument("--no-shared-experts", action="store_true",
+                    help="Ablation: remove shared expert contribution (zero out)")
+parser.add_argument("--inject-bad-batch", type=int, default=-1,
+                    help="Ablation: multiply gradient by 10x at this step (-1 = disabled)")
+
+# ─── Architecture override flags (Phase 3 architecture experiments) ───
+parser.add_argument("--num-experts", type=int, default=-1,
+                    help="Override n_routed_experts (e.g. 16 for fewer-experts ablation)")
+parser.add_argument("--top-k", type=int, default=-1,
+                    help="Override num_experts_per_tok (e.g. 2 for fewer-experts ablation)")
+parser.add_argument("--n-group", type=int, default=-1,
+                    help="Override n_group for routing (e.g. 4 for 16-expert config)")
+parser.add_argument("--topk-group", type=int, default=-1,
+                    help="Override topk_group for routing")
+
+# ─── Scaling law sweep overrides ───
+parser.add_argument("--total-tokens", type=int, default=-1,
+                    help="Override total training tokens (-1 = use config default)")
+parser.add_argument("--hidden-size", type=int, default=-1,
+                    help="Override hidden_size (for scaling sweep configs)")
+
+# ─── Config from YAML ───
+parser.add_argument("--config-yaml", type=str, default="",
+                    help="Path to YAML config file (overrides individual CLI flags)")
+
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# -----------------------------------------------------------------------------
+# Seed management for reproducibility
+# Without this, every run produces different results — can't reproduce ablations.
+import random
+import numpy as np
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)  # for multi-GPU
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -137,10 +194,65 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')
 
-# ─── W&B ───
+# ─── W&B with ablation metadata ───
+# Ablation taxonomy: each run is tagged with its ablation group + specific variant
+# so that W&B filtering works: "show me all stability runs", "compare A vs C", etc.
+def _classify_ablation(run_name, args):
+    """Derive W&B group, tags, and notes from run name and ablation flags."""
+    tags = [f"scale:{args.scale}"]
+    group = f"{args.scale}"  # default: group by scale
+    notes = ""
+
+    # Detect ablation group from run name prefix
+    if run_name.startswith("hp-"):
+        tags.append("ablation:hp-transfer")
+        group = f"hp-{args.scale}"
+        notes = "muP hyperparameter transfer validation"
+    elif run_name.startswith("stab-"):
+        tags.append("ablation:stability")
+        group = f"stability-{args.scale}"
+        notes = "Training stability ablation (DeepSeek V3.2 techniques)"
+    elif run_name.startswith("arch-"):
+        tags.append("ablation:architecture")
+        group = f"architecture-{args.scale}"
+        notes = "Architecture sensitivity ablation"
+    elif run_name.startswith("gate1"):
+        tags.append("gate:smoke-test")
+        group = f"gate1-{args.scale}"
+        notes = "Gate 1 smoke test (100 steps)"
+
+    # Tag specific ablation flags
+    if args.no_seq_aux:
+        tags.append("variant:no-seq-aux")
+    if args.no_grad_clip:
+        tags.append("variant:no-grad-clip")
+    if args.aux_loss_type == "classic":
+        tags.append("variant:classic-aux-loss")
+    if args.no_mtp:
+        tags.append("variant:no-mtp")
+    if args.no_shared_experts:
+        tags.append("variant:no-shared-experts")
+    if args.inject_bad_batch >= 0:
+        tags.append(f"variant:bad-batch-{args.inject_bad_batch}")
+    if args.num_experts > 0:
+        tags.append(f"variant:experts-{args.num_experts}")
+    if args.top_k > 0:
+        tags.append(f"variant:topk-{args.top_k}")
+    if args.config_yaml:
+        tags.append(f"config:{os.path.basename(args.config_yaml)}")
+
+    return group, tags, notes
+
+ablation_group, ablation_tags, ablation_notes = _classify_ablation(args.run, args)
+
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
-    project="nanoseek", name=args.run, config=vars(args)
+    project="nanoseek",
+    name=args.run,
+    group=ablation_group,
+    tags=ablation_tags,
+    notes=ablation_notes,
+    config=vars(args),  # CLI args (pre-override)
 )
 # ─── Select config from muP transfer path ───
 config_map = {
@@ -166,7 +278,7 @@ def validate_config(cfg):
         errors.append(f"RULE 2: gamma_freeze_ratio={cfg.moe.gamma_freeze_ratio}, must be 0.95")
     if cfg.adam_beta2 != 0.95:
         errors.append(f"adam_beta2={cfg.adam_beta2}, expected 0.95 (DeepSeek style)")
-    if cfg.max_grad_norm != 1.0:
+    if cfg.max_grad_norm != 1.0 and not args.no_grad_clip:
         errors.append(f"max_grad_norm={cfg.max_grad_norm}, expected 1.0")
     if errors:
         for e in errors:
@@ -174,7 +286,127 @@ def validate_config(cfg):
         raise ValueError(f"Config validation failed: {len(errors)} error(s)")
     print0("  Config validation: PASSED")
 
+# ─── Apply ablation overrides BEFORE validation ───
+if args.no_seq_aux:
+    config.moe.seq_aux_loss_alpha = 0.0
+    print0("ABLATION: seq_aux disabled (alpha=0)")
+
+if args.no_grad_clip:
+    config.max_grad_norm = float('inf')
+    print0("ABLATION: gradient clipping disabled (max_norm=inf)")
+
+if args.aux_loss_type == "classic":
+    # Classic aux loss: higher alpha, no bias-based balancing
+    config.moe.seq_aux_loss_alpha = 0.01
+    print0("ABLATION: classic aux loss (alpha=0.01, bias updates will be skipped)")
+
+if args.no_mtp:
+    config.mtp.mtp_loss_weight_initial = 0.0
+    config.mtp.mtp_loss_weight_final = 0.0
+    print0("ABLATION: MTP disabled (lambda=0 throughout training)")
+
+if args.no_shared_experts:
+    config.moe.disable_shared_experts = True
+    print0("ABLATION: shared experts disabled (output zeroed)")
+
+if args.inject_bad_batch >= 0:
+    print0(f"ABLATION: bad batch injection at step {args.inject_bad_batch} (10x gradient)")
+
+# ─── Architecture overrides (must come before model build) ───
+if args.num_experts > 0:
+    old_e = config.moe.n_routed_experts
+    config.moe.n_routed_experts = args.num_experts
+    print0(f"OVERRIDE: n_routed_experts {old_e} → {args.num_experts}")
+
+if args.top_k > 0:
+    old_k = config.moe.num_experts_per_tok
+    config.moe.num_experts_per_tok = args.top_k
+    print0(f"OVERRIDE: num_experts_per_tok {old_k} → {args.top_k}")
+
+if args.n_group > 0:
+    old_g = config.moe.n_group
+    config.moe.n_group = args.n_group
+    print0(f"OVERRIDE: n_group {old_g} → {args.n_group}")
+
+if args.topk_group > 0:
+    old_tg = config.moe.topk_group
+    config.moe.topk_group = args.topk_group
+    print0(f"OVERRIDE: topk_group {old_tg} → {args.topk_group}")
+
+if args.total_tokens > 0:
+    old_t = config.total_tokens
+    config.total_tokens = args.total_tokens
+    print0(f"OVERRIDE: total_tokens {old_t:,} → {args.total_tokens:,}")
+
+if args.hidden_size > 0:
+    old_h = config.hidden_size
+    config.hidden_size = args.hidden_size
+    print0(f"OVERRIDE: hidden_size {old_h} → {args.hidden_size}")
+
+# ─── YAML config override (loads all overrides from a single file) ───
+if args.config_yaml:
+    import yaml
+    with open(args.config_yaml, 'r') as f:
+        yaml_cfg = yaml.safe_load(f)
+    print0(f"Loading config overrides from {args.config_yaml}")
+    # Apply top-level overrides
+    for key in ['total_tokens', 'hidden_size', 'num_layers', 'sequence_length',
+                'vocab_size', 'max_grad_norm']:
+        if key in yaml_cfg:
+            old_val = getattr(config, key)
+            setattr(config, key, yaml_cfg[key])
+            print0(f"  YAML: {key} {old_val} → {yaml_cfg[key]}")
+    # Apply MoE overrides
+    if 'moe' in yaml_cfg:
+        for key, val in yaml_cfg['moe'].items():
+            if hasattr(config.moe, key):
+                old_val = getattr(config.moe, key)
+                setattr(config.moe, key, val)
+                print0(f"  YAML: moe.{key} {old_val} → {val}")
+    # Apply MTP overrides
+    if 'mtp' in yaml_cfg:
+        for key, val in yaml_cfg['mtp'].items():
+            if hasattr(config.mtp, key):
+                old_val = getattr(config.mtp, key)
+                setattr(config.mtp, key, val)
+                print0(f"  YAML: mtp.{key} {old_val} → {val}")
+    # Apply MLA overrides
+    if 'mla' in yaml_cfg:
+        for key, val in yaml_cfg['mla'].items():
+            if hasattr(config.mla, key):
+                old_val = getattr(config.mla, key)
+                setattr(config.mla, key, val)
+                print0(f"  YAML: mla.{key} {old_val} → {val}")
+    # Apply training overrides (LR, etc.)
+    if 'training' in yaml_cfg:
+        for key, val in yaml_cfg['training'].items():
+            if key in vars(args):
+                old_val = getattr(args, key.replace('-', '_'))
+                setattr(args, key.replace('-', '_'), val)
+                print0(f"  YAML: args.{key} {old_val} → {val}")
+
 validate_config(config)
+
+# ─── Log effective config to W&B (post-ablation overrides) ───
+# This captures the ACTUAL values used, not just CLI args.
+# Critical for reproducing: "what was seq_aux_loss_alpha for run stab-C?"
+if not use_dummy_wandb:
+    wandb_run.config.update({
+        "effective/seq_aux_loss_alpha": config.moe.seq_aux_loss_alpha,
+        "effective/max_grad_norm": config.max_grad_norm,
+        "effective/mtp_loss_weight_initial": config.mtp.mtp_loss_weight_initial,
+        "effective/mtp_loss_weight_final": config.mtp.mtp_loss_weight_final,
+        "effective/disable_shared_experts": config.moe.disable_shared_experts,
+        "effective/gamma_freeze_ratio": config.moe.gamma_freeze_ratio,
+        "effective/aux_loss_type": args.aux_loss_type,
+        "effective/inject_bad_batch": args.inject_bad_batch,
+        "effective/n_routed_experts": config.moe.n_routed_experts,
+        "effective/num_experts_per_tok": config.moe.num_experts_per_tok,
+        "effective/n_group": config.moe.n_group,
+        "effective/topk_group": config.moe.topk_group,
+        "effective/total_tokens": config.total_tokens,
+        "effective/hidden_size": config.hidden_size,
+    }, allow_val_change=True)
 
 # ─── Build model ───
 print0("Building model on meta device...")
@@ -742,13 +974,40 @@ model = torch.compile(model, dynamic=False)
 ema_tracker = EMATracker(orig_model, decay=args.ema_decay)
 print0(f"EMA tracker initialized (decay={args.ema_decay}, update every {args.ema_every} steps)")
 
+# ─── Checkpoint manager (atomic writes + disk cleanup) ───
+# Include run name in checkpoint dir so ablation runs don't overwrite each other.
+# e.g., checkpoints/nanoseek_anchor/stab-A-baseline/
+checkpoint_dir = os.path.join("checkpoints", f"nanoseek_{args.scale}", args.run)
+ckpt_manager = CheckpointManager(
+    checkpoint_dir=checkpoint_dir,
+    save_every=args.save_every,
+    keep_last_n=3,           # ~228 GB max for 1B (3 × 76 GB) — fits 200 GB volume
+    save_optimizer=True,     # MUST save optimizer for correct resume
+)
+print0(f"CheckpointManager: dir={checkpoint_dir}, save_every={args.save_every}, keep_last_n=3")
+
+# ─── Graceful shutdown signal handler ───
+# RunPod sends SIGTERM 30s before preemption. Without this handler,
+# we lose everything since the last checkpoint (potentially hours of work).
+import signal
+
+_shutdown_requested = False
+
+def _shutdown_handler(signum, frame):
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name
+    print0(f"\n⚠️  Received {sig_name} — will save emergency checkpoint after current step")
+    _shutdown_requested = True
+
+signal.signal(signal.SIGTERM, _shutdown_handler)
+signal.signal(signal.SIGINT, _shutdown_handler)
+
 # ─── Resume from checkpoint ───
 resume_step = 0
 resume_dataloader_state = None
 resume_loop_state = {}
 
 if args.resume_from_step >= 0:
-    checkpoint_dir = os.path.join("checkpoints", f"nanoseek_{args.scale}")
     resume_step_arg = args.resume_from_step if args.resume_from_step > 0 else None  # 0 = latest
     print0(f"Resuming from checkpoint (step={resume_step_arg or 'latest'})...")
 
@@ -815,10 +1074,12 @@ while True:
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         eval_steps = args.eval_tokens // (args.device_batch_size * config.sequence_length * ddp_world_size)
-        val_loader = build_val_loader()
+        # Fresh val_loader for BPB eval — each metric gets its own loader
+        # to avoid consuming data that subsequent metrics need.
+        val_loader_bpb = build_val_loader()
         # Swap EMA weights onto orig_model, evaluate, then restore
         with ema_tracker.apply(orig_model):
-            ema_val_bpb = evaluate_nanoseek_bpb(orig_model, val_loader, eval_steps, token_bytes)
+            ema_val_bpb = evaluate_nanoseek_bpb(orig_model, val_loader_bpb, eval_steps, token_bytes)
 
             # ─── Milestone eval: I_spec, domain BPB, dead experts (RULE 7) ───
             progress = step / max(num_iterations, 1)
@@ -828,7 +1089,8 @@ while True:
             if is_milestone or last_step:
                 print0(f"  Milestone eval at {progress:.1%}...")
                 try:
-                    i_spec_result = compute_i_spec(orig_model, val_loader, device)
+                    val_loader_ispec = build_val_loader()
+                    i_spec_result = compute_i_spec(orig_model, val_loader_ispec, device)
                     milestone_metrics["eval/i_spec_mean"] = i_spec_result['i_spec_mean']
                     for i, v in enumerate(i_spec_result.get('i_spec_per_layer', [])):
                         milestone_metrics[f"eval/i_spec_layer_{i}"] = v
@@ -837,7 +1099,8 @@ while True:
                     print0(f"  I_spec failed: {e}")
 
                 try:
-                    dead_result = compute_dead_experts(orig_model, val_loader, device)
+                    val_loader_dead = build_val_loader()
+                    dead_result = compute_dead_experts(orig_model, val_loader_dead, device)
                     milestone_metrics["eval/dead_expert_count"] = dead_result['total_dead_count']
                     if dead_result['total_dead_count'] > 0:
                         print0(f"  WARNING: {dead_result['total_dead_count']} dead experts detected!")
@@ -858,7 +1121,8 @@ while True:
             mtp_metrics = {}
             if step > 0 and step % 2000 == 0:
                 try:
-                    mtp_result = compute_mtp_acceptance_rate(orig_model, val_loader, device)
+                    val_loader_mtp = build_val_loader()
+                    mtp_result = compute_mtp_acceptance_rate(orig_model, val_loader_mtp, device)
                     mtp_metrics["eval/mtp_acceptance_rate"] = mtp_result['acceptance_rate']
                     for pos, rate in mtp_result.get('per_position_rates', {}).items():
                         mtp_metrics[f"eval/mtp_pos_{pos}"] = rate
@@ -888,35 +1152,51 @@ while True:
         })
 
     # ─────────────────────────────────────────────────────────────
-    # CHECKPOINT SAVING
+    # CHECKPOINT SAVING (atomic writes + disk cleanup + EMA bundled)
     # ─────────────────────────────────────────────────────────────
-    if last_step or (step > 0 and args.save_every > 0 and step % args.save_every == 0):
-        checkpoint_dir = os.path.join("checkpoints", f"nanoseek_{args.scale}")
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            optimizer.state_dict(),
-            {
-                "step": step,
+    should_save = ckpt_manager.should_save(step, last_step) or _shutdown_requested
+    if should_save:
+        # DDP barrier: ensure all ranks are done with training step
+        # before rank 0 starts I/O (prevents gradient sync stalls)
+        if ddp:
+            dist.barrier()
+
+        ckpt_metadata = {
+            "step": step,
+            "tokens_processed": tokens_processed,
+            "ema_val_bpb": ema_val_bpb,
+            "config": asdict(config),
+            "dataloader_state_dict": dataloader_state_dict,
+            "loop_state": {
                 "tokens_processed": tokens_processed,
-                "ema_val_bpb": ema_val_bpb,
-                "config": asdict(config),
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": {
-                    "tokens_processed": tokens_processed,
-                    "min_ema_val_bpb": min_ema_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
+                "min_ema_val_bpb": min_ema_val_bpb,
+                "smooth_train_loss": smooth_train_loss,
+                "total_training_time": total_training_time,
             },
+        }
+
+        # Save model + optimizer + EMA atomically (all or nothing per file)
+        # EMA is bundled into save_checkpoint so it can't be missing after crash
+        saved_path = ckpt_manager.save(
+            step=step,
+            model_state=orig_model.state_dict(),
+            optimizer_state=optimizer.state_dict(),
+            metadata=ckpt_metadata,
+            ema_state=ema_tracker.state_dict(),
             rank=ddp_rank,
         )
-        # Save EMA state separately — tensors can't go in JSON metadata
-        if ddp_rank == 0:
-            ema_path = os.path.join(checkpoint_dir, f"ema_{step:06d}.pt")
-            torch.save(ema_tracker.state_dict(), ema_path)
-            print0(f"Saved EMA state to: {ema_path}")
+        if saved_path:
+            print0(f"Checkpoint saved: {saved_path} (step {step})")
+
+        # If this was a shutdown request, exit cleanly after saving
+        if _shutdown_requested:
+            print0(f"Emergency checkpoint saved at step {step}. Exiting gracefully.")
+            wandb_run.finish()
+            gc.enable()
+            gc.collect()
+            compute_cleanup()
+            import sys
+            sys.exit(0)
 
     # ─── Termination ───
     if last_step:
@@ -953,13 +1233,17 @@ while True:
     mtp_loss_accum = 0.0
     aux_loss_accum = 0.0
     for micro_step in range(current_accum):
-        outputs = model(
-            x,
-            labels=x,
-            tokens_processed=tokens_processed,
-            total_tokens=config.total_tokens,
-        )
-        loss = outputs['loss']
+        # autocast: run forward pass in bf16 for 2x memory savings + 2x faster matmuls
+        # Without this, model runs in fp32 and CastLinear does nothing useful.
+        # Loss computation stays in fp32 (cross_entropy promotes automatically).
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type == "cuda")):
+            outputs = model(
+                x,
+                labels=x,
+                tokens_processed=tokens_processed,
+                total_tokens=config.total_tokens,
+            )
+            loss = outputs['loss']
         train_loss_accum += loss.detach()
         main_loss_accum += outputs['main_loss'].detach()
         mtp_loss_accum += outputs['mtp_loss'].detach()
@@ -984,10 +1268,19 @@ while True:
     # One optimizer step per training step, not per micro-step
     # ═══════════════════════════════════════════════════════════
 
+    # ─── Bad batch injection (ablation stab-F) ───
+    # Simulate a gradient spike by scaling all gradients 10×
+    if args.inject_bad_batch >= 0 and step == args.inject_bad_batch:
+        print0(f"ABLATION: Injecting 10x gradient spike at step {step}")
+        for p in orig_model.parameters():
+            if p.grad is not None:
+                p.grad.mul_(10.0)
+
     # ─── Gradient clipping (Difference #3) ───
     # MoE gradient variance is 8× higher than dense (κ=12.5%)
     # Without clipping: P(NaN within 1000 steps) ≈ 1 for bf16
-    grad_norm = clip_grad_norm_(orig_model.parameters(), max_norm=1.0)
+    clip_norm = float('inf') if args.no_grad_clip else config.max_grad_norm
+    grad_norm = clip_grad_norm_(orig_model.parameters(), max_norm=clip_norm)
 
     # Update learning rate and momentum
     lrm = get_lr_multiplier(step, warmup_steps, constant_steps, decay_steps, lr_min_ratio)
@@ -1007,7 +1300,9 @@ while True:
     # After each gradient step, adjust expert biases to redistribute load.
     # Formula: b_i -= gamma × (load_i - mean) / mean
     # Gamma freezes at 0 after 95% of training (RULE 2).
-    orig_model.update_load_balance_bias(tokens_processed, config.total_tokens)
+    # Skip bias updates when using classic aux loss (no bias-based balancing)
+    if args.aux_loss_type != "classic":
+        orig_model.update_load_balance_bias(tokens_processed, config.total_tokens)
 
     # --- EMA update (Difference #4) ---
     if step % args.ema_every == 0:

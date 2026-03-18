@@ -1,0 +1,21 @@
+# ============================================================================
+# Architecture Ablation: No Shared Experts
+# ============================================================================
+# Zeroes out shared expert output (routed experts only).
+# Control: stab-A baseline
+#
+# Pre-registered hypothesis:
+#   Loss increases by ~0.02-0.04 BPB.
+#   Shared experts handle common/universal patterns that routed experts
+#   would otherwise waste capacity on.
+#
+# Launch:
+#   python -m nanoseek.scripts.pre_train \
+#       --run "arch-no-shared" \
+#       --scale anchor \
+#       --no-shared-experts \
+#       --seed 42
+# ============================================================================
+
+moe:
+  disable_shared_experts: true

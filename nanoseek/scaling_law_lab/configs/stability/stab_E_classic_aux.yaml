@@ -1,0 +1,22 @@
+# ============================================================================
+# Stability Ablation E — Classic Auxiliary Loss (no bias-based balancing)
+# ============================================================================
+# Replaces DeepSeek V3's aux-loss-free bias balancing with traditional aux loss.
+# Sets alpha=0.01 (standard GShard/Switch Transformer value).
+# Bias updates are skipped.
+#
+# Pre-registered hypothesis:
+#   Aux-loss-free (stab-A) achieves I_spec >0.1 nats higher than classic.
+#   This is the CORE V3 claim — bias-based > loss-based for specialization.
+#
+# Launch:
+#   python -m nanoseek.scripts.pre_train \
+#       --run "stab-E-classic-aux" \
+#       --scale anchor \
+#       --aux-loss-type classic \
+#       --seed 42
+# ============================================================================
+
+moe:
+  seq_aux_loss_alpha: 0.01
+# Note: aux-loss-type=classic also disables bias updates in the training loop

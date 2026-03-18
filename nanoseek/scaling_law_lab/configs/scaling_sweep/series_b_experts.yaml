@@ -1,0 +1,72 @@
+# ============================================================================
+# Series B: Expert Count Sweep — 4 configs
+# ============================================================================
+# Purpose: Isolate the log(E) correction term in L(N_active, D, E).
+# Hold N_active ≈ 75M and D = 1.5B fixed. Vary E from 8 to 64.
+# top_k varies proportionally to maintain N_active.
+#
+# Confound: per-expert FFN width varies (wider at low E, narrower at high E).
+# This co-varies granularity with E. Acknowledged in analysis.
+#
+# Pre-registered hypothesis:
+#   Loss decreases monotonically with E (diminishing returns).
+#   γ ≈ 0.5-1.0 (moderate expert scaling benefit).
+# ============================================================================
+
+# Base config: nano-80M architecture (hidden=512, 8 layers)
+base:
+  hidden_size: 512
+  num_layers: 8
+  num_heads: 4
+  intermediate_size: 1311
+  total_tokens: 1_500_000_000
+  global_batch_size: 48
+  sequence_length: 4096
+  mla:
+    q_lora_rank: 112
+    kv_lora_rank: 40
+  mtp:
+    mtp_num_heads: 4
+
+configs:
+  expert_sweep_E8:
+    moe:
+      n_routed_experts: 8
+      num_experts_per_tok: 2    # κ = 2/8 = 25% (wider experts compensate)
+      n_group: 2
+      topk_group: 1
+      # N_active ≈ 75M: need 2 experts × inter to match 4 × 192
+      # 2 × 384 = 768 ≈ 4 × 192 = 768 ✓
+      moe_intermediate_size: 384
+      first_k_dense_replace: 1
+    run_name: "scaling-b-E8"
+
+  expert_sweep_E16:
+    moe:
+      n_routed_experts: 16
+      num_experts_per_tok: 4    # κ = 4/16 = 25%
+      n_group: 4
+      topk_group: 2
+      moe_intermediate_size: 192  # 4 × 192 = 768 active expert width
+      first_k_dense_replace: 1
+    run_name: "scaling-b-E16"
+
+  expert_sweep_E32:
+    moe:
+      n_routed_experts: 32
+      num_experts_per_tok: 4    # κ = 4/32 = 12.5%
+      n_group: 4
+      topk_group: 2
+      moe_intermediate_size: 192
+      first_k_dense_replace: 1
+    run_name: "scaling-b-E32"
+
+  expert_sweep_E64:
+    moe:
+      n_routed_experts: 64
+      num_experts_per_tok: 8    # κ = 8/64 = 12.5%
+      n_group: 8
+      topk_group: 4
+      moe_intermediate_size: 96   # 8 × 96 = 768 active expert width
+      first_k_dense_replace: 1
+    run_name: "scaling-b-E64"

@@ -1,0 +1,129 @@
+{
+  "current_stage": "500m-grid",
+  "completed_stages": [
+    "gate1",
+    "hp-grid",
+    "stability",
+    "architecture",
+    "hp-analysis",
+    "500m-transfer",
+    "mup-check"
+  ],
+  "best_hp": {},
+  "gate1_passed": true,
+  "mup_transfer_passed": true,
+  "run_results": {
+    "gate1-smoke": {
+      "name": "gate1-smoke",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.005-elr0.1": {
+      "name": "hp-anchor-mlr0.005-elr0.1",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.005-elr0.3": {
+      "name": "hp-anchor-mlr0.005-elr0.3",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.005-elr0.5": {
+      "name": "hp-anchor-mlr0.005-elr0.5",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.01-elr0.1": {
+      "name": "hp-anchor-mlr0.01-elr0.1",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.01-elr0.3": {
+      "name": "hp-anchor-mlr0.01-elr0.3",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.01-elr0.5": {
+      "name": "hp-anchor-mlr0.01-elr0.5",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.02-elr0.1": {
+      "name": "hp-anchor-mlr0.02-elr0.1",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.02-elr0.3": {
+      "name": "hp-anchor-mlr0.02-elr0.3",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.02-elr0.5": {
+      "name": "hp-anchor-mlr0.02-elr0.5",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.04-elr0.1": {
+      "name": "hp-anchor-mlr0.04-elr0.1",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.04-elr0.3": {
+      "name": "hp-anchor-mlr0.04-elr0.3",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-anchor-mlr0.04-elr0.5": {
+      "name": "hp-anchor-mlr0.04-elr0.5",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "stab-A-baseline": {
+      "name": "stab-A-baseline",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "stab-C-no-seq-aux": {
+      "name": "stab-C-no-seq-aux",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "stab-D-no-gradclip": {
+      "name": "stab-D-no-gradclip",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "stab-E-classic-aux": {
+      "name": "stab-E-classic-aux",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "stab-F-bad-batch": {
+      "name": "stab-F-bad-batch",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "arch-no-mtp": {
+      "name": "arch-no-mtp",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "arch-no-shared": {
+      "name": "arch-no-shared",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "arch-fewer-experts": {
+      "name": "arch-fewer-experts",
+      "status": "dry_run",
+      "runtime": 0
+    },
+    "hp-500m-transfer": {
+      "name": "hp-500m-transfer",
+      "status": "dry_run",
+      "runtime": 0
+    }
+  },
+  "start_time": 1773828540.041728,
+  "total_cost_estimate": 0.0
+}

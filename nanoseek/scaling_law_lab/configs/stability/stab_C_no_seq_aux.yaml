@@ -1,0 +1,20 @@
+# ============================================================================
+# Stability Ablation C — No Sequence Auxiliary Loss
+# ============================================================================
+# Removes seq_aux_loss_alpha (sets to 0).
+# Bias-based balancing still active.
+#
+# Pre-registered hypothesis:
+#   Removing seq_aux drops I_spec by >0.1 nats vs stab-A.
+#   seq_aux provides complementary sequence-level diversification signal.
+#
+# Launch:
+#   python -m nanoseek.scripts.pre_train \
+#       --run "stab-C-no-seq-aux" \
+#       --scale anchor \
+#       --no-seq-aux \
+#       --seed 42
+# ============================================================================
+
+moe:
+  seq_aux_loss_alpha: 0.0

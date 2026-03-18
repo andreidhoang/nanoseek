@@ -1,0 +1,21 @@
+# ============================================================================
+# Architecture Ablation: No MTP
+# ============================================================================
+# Disables Multi-Token Prediction (lambda=0 throughout training).
+# Control: stab-A baseline
+#
+# Pre-registered hypothesis:
+#   Loss increases by ~0.05 BPB.
+#   MTP provides training signal (auxiliary gradient), not just inference speed.
+#
+# Launch:
+#   python -m nanoseek.scripts.pre_train \
+#       --run "arch-no-mtp" \
+#       --scale anchor \
+#       --no-mtp \
+#       --seed 42
+# ============================================================================
+
+mtp:
+  mtp_loss_weight_initial: 0.0
+  mtp_loss_weight_final: 0.0

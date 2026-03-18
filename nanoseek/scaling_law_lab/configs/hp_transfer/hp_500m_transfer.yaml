@@ -1,0 +1,31 @@
+# ============================================================================
+# HP Transfer Validation — 500M Scale
+# ============================================================================
+# Purpose: Verify muP-scaled anchor HPs work at 500M.
+# Uses best (matrix_lr, embedding_lr) from anchor grid, muP-scaled:
+#   matrix_lr_500m = best_anchor_mlr × (480/1280)  [1/width rule]
+#   embedding_lr_500m = best_anchor_elr             [constant for embeddings]
+#   batch scaling: √(B_500m / B_anchor) applied automatically
+#
+# Pre-registered hypothesis:
+#   muP-scaled anchor HP achieves ema_val_bpb within 0.02 of 500M grid optimum.
+#
+# Launch:
+#   python -m nanoseek.scripts.pre_train \
+#       --run "hp-500m-transfer" \
+#       --scale 500m \
+#       --matrix-lr <best_anchor_mlr> \
+#       --embedding-lr <best_anchor_elr> \
+#       --eval-every 500 \
+#       --save-every 2000 \
+#       --seed 42
+# ============================================================================
+
+scale: 500m
+seed: 42
+eval_every: 500
+save_every: 2000
+
+# NOTE: matrix_lr and embedding_lr should be filled in after anchor grid completes
+# matrix_lr: <FILL_FROM_ANCHOR_GRID>
+# embedding_lr: <FILL_FROM_ANCHOR_GRID>
