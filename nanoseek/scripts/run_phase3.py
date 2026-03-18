@@ -100,9 +100,13 @@ class PipelineState:
 
 def run_training(run_name: str, scale: str, extra_args: List[str],
                  dry_run: bool = False, seed: int = 42) -> dict:
-    """Execute a single training run and return metadata."""
+    """Execute a single training run via monitored_train wrapper.
+
+    Uses monitored_train.py which captures output to logs/{run_name}.log
+    and writes machine-readable status to logs/{run_name}_status.json.
+    """
     cmd = [
-        sys.executable, "-m", "nanoseek.scripts.pre_train",
+        sys.executable, "-m", "nanoseek.scripts.monitored_train",
         "--run", run_name,
         "--scale", scale,
         "--seed", str(seed),
@@ -112,6 +116,8 @@ def run_training(run_name: str, scale: str, extra_args: List[str],
     print(f"\n{'=' * 70}")
     print(f"  LAUNCHING: {run_name}")
     print(f"  Command: {' '.join(cmd)}")
+    print(f"  Log: logs/{run_name}.log")
+    print(f"  Status: logs/{run_name}_status.json")
     print(f"{'=' * 70}\n")
 
     if dry_run:
