@@ -71,16 +71,33 @@ def parse_alerts_from_line(line: str) -> list:
 
 def parse_step_from_line(line: str) -> dict:
     """Extract step number and metrics from a training log line."""
-    # Match: step 00050/4194 (1.2%) | loss: 8.1234 | H_load: 5.82 | ...
-    m = re.search(r"step (\d+)/(\d+).*loss: ([\d.]+).*H_load: ([\d.]+).*grad: ([\d.]+).*mfu: ([\d.]+)", line)
+    # Match: step 00050/4194 (1.2%) | loss: 8.1234 (main:7.9000 mtp:0.2234 aux:0.000100) | H_load: 5.82 | lr×: 0.025 | γ: 0.0010 | grad: 0.45 | dt: 1.23s | mfu: 42.1% | tok/s: 125,000
+    m = re.search(r"step (\d+)/(\d+).*loss: ([\d.]+) \(main:([\d.]+) mtp:([\d.]+) aux:([\d.]+)\).*H_load: ([\d.]+).*lr×: ([\d.]+).*γ: ([\d.]+).*grad: ([\d.]+).*dt: ([\d.]+)s.*mfu: ([\d.]+)", line)
     if m:
         return {
             "step": int(m.group(1)),
             "total_steps": int(m.group(2)),
             "loss": float(m.group(3)),
-            "h_load": float(m.group(4)),
-            "grad_norm": float(m.group(5)),
-            "mfu": float(m.group(6)),
+            "main_loss": float(m.group(4)),
+            "mtp_loss": float(m.group(5)),
+            "aux_loss": float(m.group(6)),
+            "h_load": float(m.group(7)),
+            "lr_mult": float(m.group(8)),
+            "gamma": float(m.group(9)),
+            "grad_norm": float(m.group(10)),
+            "step_time": float(m.group(11)),
+            "mfu": float(m.group(12)),
+        }
+    # Fallback: try simpler pattern for backward compat
+    m2 = re.search(r"step (\d+)/(\d+).*loss: ([\d.]+).*H_load: ([\d.]+).*grad: ([\d.]+).*mfu: ([\d.]+)", line)
+    if m2:
+        return {
+            "step": int(m2.group(1)),
+            "total_steps": int(m2.group(2)),
+            "loss": float(m2.group(3)),
+            "h_load": float(m2.group(4)),
+            "grad_norm": float(m2.group(5)),
+            "mfu": float(m2.group(6)),
         }
     return {}
 

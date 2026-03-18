@@ -1450,8 +1450,14 @@ while True:
     alerts = health_monitor.update(step, grad_norm, train_loss_f, H_load)
     for severity, msg in alerts:
         print0(f"  [{severity}] {msg}")
-        if not use_dummy_wandb:
-            wandb_run.log({"health/alert": f"[{severity}] {msg}", "step": step})
+    if alerts and not use_dummy_wandb:
+        n_critical = sum(1 for s, _ in alerts if s == "CRITICAL")
+        n_warning = sum(1 for s, _ in alerts if s == "WARNING")
+        wandb_run.log({
+            "health/critical_alerts": n_critical,
+            "health/warning_alerts": n_warning,
+            "step": step,
+        })
 
     # ─── Logging ───
     ema_beta = 0.9
@@ -1465,10 +1471,11 @@ while True:
     pct_done = 100 * step / num_iterations
     print0(
         f"step {step:05d}/{num_iterations} ({pct_done:.1f}%) | "
-        f"loss: {debiased_loss:.4f} | H_load: {H_load:.2f} | "
+        f"loss: {debiased_loss:.4f} (main:{main_loss_avg.item():.4f} mtp:{mtp_loss_avg.item():.4f} aux:{aux_loss_avg.item():.6f}) | "
+        f"H_load: {H_load:.2f} | "
         f"lr×: {lrm:.3f} | γ: {gamma:.4f} | "
         f"grad: {grad_norm:.2f} | "
-        f"batch: {current_batch_tokens:,} | "
+        f"dt: {dt:.2f}s | "
         f"mfu: {mfu:.1f}% | "
         f"tok/s: {tok_per_sec:,}"
     )
@@ -1494,6 +1501,7 @@ while True:
             "tokens_processed": tokens_processed,
             # ─── Loss breakdown (detect MTP vs LM issues separately) ───
             "train/loss": debiased_loss,
+            "train/loss_raw": train_loss_f,
             "train/main_loss": main_loss_avg.item(),
             "train/mtp_loss": mtp_loss_avg.item(),
             "train/mtp_lambda": outputs['mtp_lambda'],
@@ -1501,6 +1509,7 @@ while True:
             # ─── LR & optimization ───
             "train/lr_multiplier": lrm,
             "train/grad_norm": grad_norm.item(),
+            "train/step_time_s": dt,
             # ─── MoE health ───
             "train/H_load": H_load,
             "train/gamma": gamma,
