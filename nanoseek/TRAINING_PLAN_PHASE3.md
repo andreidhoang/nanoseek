@@ -339,7 +339,7 @@ python -m nanoseek.scripts.pre_train \
 for mlr in 0.005 0.01 0.02 0.04; do
   for elr in 0.1 0.3 0.5; do
     python -m nanoseek.scripts.pre_train \
-        --run "hp-anchor-mlr${mlr}-elr${elr}" \
+        --run "hp-r1-mlr${mlr}-elr${elr}" \
         --scale anchor \
         --matrix-lr $mlr \
         --embedding-lr $elr \

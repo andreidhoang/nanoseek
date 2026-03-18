@@ -204,10 +204,32 @@ def _classify_ablation(run_name, args):
     notes = ""
 
     # Detect ablation group from run name prefix
+    # HP search: hp-r1-* (Round 1 coarse), hp-r2-* (Round 2 fine),
+    #            hp-seed-* (Round 3 multi-seed), hp-wd-* (Round 4 weight decay),
+    #            hp-anchor-* (legacy Round 1 naming)
     if run_name.startswith("hp-"):
         tags.append("ablation:hp-transfer")
         group = f"hp-{args.scale}"
-        notes = "muP hyperparameter transfer validation"
+        if run_name.startswith("hp-r1-"):
+            tags.append("hp-round:1")
+            notes = "HP grid Round 1: coarse grid search"
+        elif run_name.startswith("hp-r2-"):
+            tags.append("hp-round:2")
+            notes = "HP grid Round 2: fine grid around R1 winner"
+        elif run_name.startswith("hp-seed-"):
+            tags.append("hp-round:3")
+            tags.append(f"seed:{args.seed}")
+            notes = "HP grid Round 3: multi-seed validation"
+        elif run_name.startswith("hp-wd-"):
+            tags.append("hp-round:4")
+            tags.append(f"weight_decay:{args.weight_decay}")
+            notes = "HP grid Round 4: weight decay sensitivity"
+        elif run_name.startswith("hp-anchor-"):
+            tags.append("hp-round:1")
+            tags.append("legacy-naming")
+            notes = "HP grid Round 1: coarse grid search (legacy naming)"
+        else:
+            notes = "muP hyperparameter transfer validation"
     elif run_name.startswith("stab-"):
         tags.append("ablation:stability")
         group = f"stability-{args.scale}"

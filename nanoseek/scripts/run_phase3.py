@@ -201,7 +201,11 @@ def find_best_hp_from_checkpoints(state: PipelineState) -> Dict[str, float]:
         return {}
 
     for run_dir in sorted(Path(ckpt_base).iterdir()):
-        if not run_dir.name.startswith("hp-anchor-"):
+        # Match hp-r1-*, hp-r2-*, hp-seed-*, hp-wd-*, hp-anchor-* (legacy)
+        if not (run_dir.name.startswith("hp-r") or
+                run_dir.name.startswith("hp-seed-") or
+                run_dir.name.startswith("hp-wd-") or
+                run_dir.name.startswith("hp-anchor-")):
             continue
 
         # Find latest metadata
@@ -222,7 +226,7 @@ def find_best_hp_from_checkpoints(state: PipelineState) -> Dict[str, float]:
 
         config = metadata.get("config", {})
 
-        # Parse LRs from run name: hp-anchor-mlr0.02-elr0.3
+        # Parse LRs from run name: hp-r1-mlr0.02-elr0.3 (or hp-anchor-mlr0.02-elr0.3 legacy)
         name = run_dir.name
         mlr = None
         elr = None
@@ -336,7 +340,7 @@ def stage_hp_grid(state: PipelineState, dry_run: bool, seed: int):
 
     for mlr in [0.005, 0.01, 0.02, 0.04]:
         for elr in [0.1, 0.3, 0.5]:
-            name = f"hp-anchor-mlr{mlr}-elr{elr}"
+            name = f"hp-r1-mlr{mlr}-elr{elr}"
             result = run_training(
                 name, "anchor",
                 ["--matrix-lr", str(mlr), "--embedding-lr", str(elr),

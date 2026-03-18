@@ -10,5 +10,5 @@ save_every: 2000
 
 # These values are PLACEHOLDERS — replace with best anchor HP after grid search
 # muP auto-scales: η_hidden = η_ref × √(B/B_ref) × (w_ref/w)
-matrix_lr: 0.02       # <-- UPDATE from hp-anchor-grid best
-embedding_lr: 0.3     # <-- UPDATE from hp-anchor-grid best
+matrix_lr: 0.02       # <-- UPDATE from hp-r1/r2 grid best
+embedding_lr: 0.3     # <-- UPDATE from hp-r1/r2 grid best

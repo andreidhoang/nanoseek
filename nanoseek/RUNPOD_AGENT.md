@@ -14,7 +14,11 @@ Running 21 training runs at anchor scale (~55M active params) on a single RTX 40
 
 The runs fall into 4 groups:
 1. **Gate 1 smoke test** (1 run, 100 steps) — verify everything works
-2. **HP grid search** (12 runs) — find best learning rates
+2. **HP grid search** (up to 32 runs across 4 rounds) — find best learning rates
+   - Round 1: coarse 4×3 grid (12 runs)
+   - Round 2: fine ±25% grid around R1 winner (9 runs)
+   - Round 3: multi-seed validation of top-3 (9 runs)
+   - Round 4: weight decay sensitivity (2 runs)
 3. **Stability ablations** (5 runs) — test DeepSeek V3 training techniques
 4. **Architecture ablations** (3 runs) — test MoE architectural choices
 
@@ -157,7 +161,7 @@ git push
 
 4. Find the best HP from the grid search:
 ```bash
-python -m nanoseek.scripts.monitored_train --list | grep hp-anchor
+python -m nanoseek.scripts.monitored_train --list | grep hp-r1
 ```
 The pipeline also saves this to `scaling_law_lab/pipeline_state.json` under `best_hp`.
 
@@ -239,8 +243,15 @@ nanoseek/
 
 All runs log to W&B project `nanoseek` with automatic grouping:
 - **Groups**: `gate1-anchor`, `hp-anchor`, `stability-anchor`, `architecture-anchor`
-- **Tags**: `scale:anchor`, `ablation:stability`, `variant:no-seq-aux`, etc.
+- **Tags**: `scale:anchor`, `ablation:stability`, `variant:no-seq-aux`, `hp-round:1`, etc.
+- **HP round tags**: `hp-round:1` (coarse), `hp-round:2` (fine), `hp-round:3` (multi-seed), `hp-round:4` (weight decay)
 - **Config**: both CLI args and `effective/*` post-override values
+
+**HP run name convention:**
+- Round 1: `hp-r1-mlr{mlr}-elr{elr}` (12 runs, coarse grid)
+- Round 2: `hp-r2-mlr{mlr}-elr{elr}` (9 runs, fine grid around R1 winner)
+- Round 3: `hp-seed-mlr{mlr}-elr{elr}-s{seed}` (9 runs, 3 configs × 3 seeds)
+- Round 4: `hp-wd-mlr{mlr}-elr{elr}-wd{wd}` (2 runs, weight decay sensitivity)
 
 Dashboard URL: https://wandb.ai (check your entity)
 

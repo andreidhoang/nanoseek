@@ -49,7 +49,7 @@ for mlr in 0.005 0.01 0.02 0.04; do
   for elr in 0.1 0.3 0.5; do
     echo "--- Launching: matrix_lr=${mlr}, embedding_lr=${elr} ---"
     python -m nanoseek.scripts.pre_train \
-        --run "hp-anchor-mlr${mlr}-elr${elr}" \
+        --run "hp-r1-mlr${mlr}-elr${elr}" \
         --scale anchor \
         --matrix-lr $mlr \
         --embedding-lr $elr \
