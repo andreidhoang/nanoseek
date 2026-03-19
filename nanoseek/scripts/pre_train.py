@@ -142,6 +142,8 @@ parser.add_argument("--no-shared-experts", action="store_true",
                     help="Ablation: remove shared expert contribution (zero out)")
 parser.add_argument("--inject-bad-batch", type=int, default=-1,
                     help="Ablation: multiply gradient by 10x at this step (-1 = disabled)")
+parser.add_argument("--no-compile", action="store_true",
+                    help="Skip torch.compile (useful for debugging or incompatible GPUs)")
 
 # ─── Architecture override flags (Phase 3 architecture experiments) ───
 parser.add_argument("--num-experts", type=int, default=-1,
@@ -1006,7 +1008,26 @@ optimizer = setup_optimizer(
 )
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+
+# ─── torch.compile with timing ───
+# torch.compile is lazy — actual kernel compilation happens on first forward pass.
+# Expected compile times by scale:
+#   anchor (~55M):  1-5 min (first run), <30s (cached)
+#   500M:           2-8 min (first run), <30s (cached)
+#   1B:             3-10 min (first run), <30s (cached)
+# If compile exceeds 15 min, something is wrong (PyTorch/CUDA version mismatch,
+# incompatible GPU architecture, or infinite recompilation loop).
+COMPILE_TIMEOUT_MINUTES = 15
+_compile_start_time = time.time()
+if args.no_compile:
+    print0("torch.compile SKIPPED (--no-compile flag set)")
+else:
+    model = torch.compile(model, dynamic=False)
+    print0(f"torch.compile registered (lazy — actual compilation on first forward pass)")
+    print0(f"  Compile timeout: {COMPILE_TIMEOUT_MINUTES} min. If step 0 takes longer, check:")
+    print0(f"  1. PyTorch version supports your GPU (run: python -c \"import torch; torch.zeros(1).cuda()\")")
+    print0(f"  2. CUDA toolkit version matches PyTorch build")
+    print0(f"  3. Try --no-compile flag or TORCH_COMPILE_DISABLE=1 to skip compilation")
 
 # ─── EMA tracker ───
 ema_tracker = EMATracker(orig_model, decay=args.ema_decay)
@@ -1077,7 +1098,9 @@ if args.resume_from_step >= 0:
     print0(f"  Resuming from step {resume_step}, tokens={metadata.get('tokens_processed', 'unknown')}")
 
     # Re-compile after loading weights
-    model = torch.compile(orig_model, dynamic=False)
+    _compile_start_time = time.time()
+    if not args.no_compile:
+        model = torch.compile(orig_model, dynamic=False)
 
 # ─── Data loaders ───
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
@@ -1533,6 +1556,21 @@ while True:
         f"mfu: {mfu:.1f}% | "
         f"tok/s: {tok_per_sec:,}"
     )
+
+    # ─── Compile time check (step 0 includes torch.compile kernel generation) ───
+    if step == 0 and '_compile_start_time' in dir():
+        compile_elapsed = (time.time() - _compile_start_time) / 60
+        if compile_elapsed > COMPILE_TIMEOUT_MINUTES:
+            print0(f"  [CRITICAL] torch.compile took {compile_elapsed:.1f} min "
+                   f"(limit: {COMPILE_TIMEOUT_MINUTES} min). This usually means:")
+            print0(f"    - PyTorch doesn't support your GPU architecture")
+            print0(f"    - CUDA version mismatch")
+            print0(f"    - Try: TORCH_COMPILE_DISABLE=1 or upgrade PyTorch")
+        elif compile_elapsed > 5:
+            print0(f"  [INFO] torch.compile took {compile_elapsed:.1f} min "
+                   f"(normal: 1-5 min first run, <30s cached)")
+        else:
+            print0(f"  [INFO] torch.compile: {compile_elapsed:.1f} min (OK)")
 
     if step % config.log_every_steps == 0:
         # ─── Collect per-group LRs (verify muP scaling is correct) ───
