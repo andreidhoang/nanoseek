@@ -1385,6 +1385,37 @@ class NanoSeekModel(nn.Module):
         and implicitly during __init__().
         """
         self._init_weights()
+        self._reinit_buffers()
+
+    def _reinit_buffers(self) -> None:
+        """Recompute non-persistent buffers (RoPE freqs_cis) after to_empty().
+
+        When constructing on meta device, buffers are created without data.
+        to_empty() moves them to the target device filled with zeros.
+        init_weights() only handles nn.Linear/nn.Embedding parameters.
+        This method recomputes any buffers that require non-trivial initialization.
+        """
+        config = self.config
+        for layer in self.layers:
+            attn = layer.self_attn
+            attn.freqs_cis = precompute_freqs_cis(
+                config.mla.qk_rope_head_dim,
+                config.max_position_embeddings,
+                config.mla.rope_theta,
+                config.mla.rope_scaling_factor,
+                config.mla.original_max_position_embeddings,
+            ).to(device=attn.freqs_cis.device)
+        # MTP also has its own MLA with freqs_cis
+        if self.mtp is not None:
+            for mtp_mod in self.mtp.mtp_modules:
+                mtp_attn = mtp_mod.transformer.attn
+                mtp_attn.freqs_cis = precompute_freqs_cis(
+                    config.mla.qk_rope_head_dim,
+                    config.max_position_embeddings,
+                    config.mla.rope_theta,
+                    config.mla.rope_scaling_factor,
+                    config.mla.original_max_position_embeddings,
+                ).to(device=mtp_attn.freqs_cis.device)
 
     def _init_weights(self) -> None:
         """Width-dependent weight initialization with zero-init output projections.
@@ -1404,6 +1435,11 @@ class NanoSeekModel(nn.Module):
                     torch.nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            elif isinstance(module, RMSNorm):
+                # RMSNorm weight should be ones (multiplicative scale).
+                # With meta device + to_empty(), these are uninitialized (zeros),
+                # which kills ALL signal through the model.
+                torch.nn.init.ones_(module.weight)
 
         # Small-scale init for output projections (near-identity at init).
         # Zero-init works for dense models (GPT-2/nanochat pattern), but for MoE:
@@ -1426,10 +1462,15 @@ class NanoSeekModel(nn.Module):
                 for expert in layer.ffn.routed_experts:
                     torch.nn.init.normal_(expert.w_down.weight, mean=0.0, std=output_std)
                 torch.nn.init.normal_(layer.ffn.shared_expert.w_down.weight, mean=0.0, std=output_std)
-        # MTP concat_proj: still zero-init (MTP heads should start as identity)
+        # MTP concat_proj: small random init (NOT zero — zero kills all forward signal,
+        # producing exactly uniform logits and loss = ln(V) with zero gradient to MTP params).
+        # Use same output_std as other residual-stream projections for consistent scale.
         if self.mtp is not None:
             for mtp_mod in self.mtp.mtp_modules:
-                torch.nn.init.zeros_(mtp_mod.concat_proj.weight)
+                torch.nn.init.normal_(mtp_mod.concat_proj.weight, mean=0.0, std=output_std)
+                # Also init transformer block's output projections for residual-stream scale
+                torch.nn.init.normal_(mtp_mod.transformer.attn.wo.weight, mean=0.0, std=output_std)
+                torch.nn.init.normal_(mtp_mod.transformer.ffn.w_down.weight, mean=0.0, std=output_std)
 
     # -----------------------------------------------------------------
     # Forward Pass
@@ -1443,8 +1484,7 @@ class NanoSeekModel(nn.Module):
         past_key_values: Optional[List[Tuple[Tensor, Tensor]]] = None,
         use_cache: bool = False,
         labels: Optional[Tensor] = None,
-        tokens_processed: int = 0,
-        total_tokens: int = 1,
+        mtp_lambda: float = 0.3,
     ) -> Dict[str, Tensor]:
         """Complete forward pass.
 
@@ -1455,8 +1495,7 @@ class NanoSeekModel(nn.Module):
             past_key_values: list of (c_kv, k_pe) tuples per layer for KV cache
             use_cache: whether to return updated KV cache
             labels: [B, S] target token IDs for loss computation
-            tokens_processed: current token count (for MTP/gamma schedule)
-            total_tokens: total training tokens (for MTP/gamma schedule)
+            mtp_lambda: pre-computed MTP loss weight (compute outside to avoid compile recompilation)
 
         Returns:
             dict with keys:
@@ -1541,12 +1580,12 @@ class NanoSeekModel(nn.Module):
         loss = None
         main_loss = None
         mtp_loss = None
-        mtp_lambda = 0.0
+        # mtp_lambda is passed as a function parameter — do NOT shadow it here
         if labels is not None:
             loss_dict = self._compute_loss(
                 logits, labels, hidden_states, input_ids,
                 total_aux_loss, n_aux_layers,
-                tokens_processed, total_tokens,
+                mtp_lambda,
             )
             loss = loss_dict["total_loss"]
             main_loss = loss_dict["main_loss"]
@@ -1577,8 +1616,7 @@ class NanoSeekModel(nn.Module):
         input_ids: Tensor,
         total_aux_loss: Tensor,
         n_aux_layers: int,
-        tokens_processed: int,
-        total_tokens: int,
+        mtp_lambda: float,
     ) -> Dict[str, Tensor]:
         """Compute total training loss with component breakdown.
 
@@ -1591,8 +1629,7 @@ class NanoSeekModel(nn.Module):
             input_ids: [B, S] — original input (for MTP token shifting)
             total_aux_loss: accumulated MoE load-balancing loss
             n_aux_layers: number of MoE layers that contributed
-            tokens_processed: for MTP loss weight schedule
-            total_tokens: for MTP loss weight schedule
+            mtp_lambda: pre-computed MTP loss weight (avoids compile recompilation)
 
         Returns:
             dict with total_loss, main_loss, mtp_loss, mtp_lambda
@@ -1610,18 +1647,10 @@ class NanoSeekModel(nn.Module):
 
         total_loss = main_loss
         mtp_loss = torch.zeros(1, device=logits.device)
-        mtp_lambda = 0.0
 
         # MTP auxiliary loss (training only)
         if self.training and self.mtp is not None:
             _, mtp_loss = self.mtp(hidden_states, input_ids)
-            mtp_lambda = get_mtp_loss_weight(
-                tokens_processed,
-                total_tokens,
-                self.config.mtp.mtp_loss_weight_initial,
-                self.config.mtp.mtp_loss_weight_final,
-                self.config.mtp.mtp_loss_transition_ratio,
-            )
             total_loss = total_loss + mtp_lambda * mtp_loss
 
         # MoE load-balancing auxiliary loss
@@ -1698,25 +1727,34 @@ class NanoSeekModel(nn.Module):
         Returns:
             entropy: mean H_load across MoE layers (higher = more balanced)
             load_per_expert: [E] mean token counts per expert
+            per_layer: dict of {layer_idx: {"load_counts": Tensor, "H_load": Tensor}}
         """
         all_H = []
         all_counts = []
-        for aux_data in self._layer_aux_data.values():
+        per_layer = {}
+        for layer_idx, aux_data in self._layer_aux_data.items():
+            layer_info = {}
             if "H_load" in aux_data:
                 all_H.append(aux_data["H_load"])
+                layer_info["H_load"] = aux_data["H_load"]
             if "load_counts" in aux_data:
                 all_counts.append(aux_data["load_counts"])
+                layer_info["load_counts"] = aux_data["load_counts"]
+            if layer_info:
+                per_layer[layer_idx] = layer_info
 
         if not all_H:
             n_experts = self.config.moe.n_routed_experts
             return {
                 "entropy": torch.tensor(0.0),
                 "load_per_expert": torch.zeros(n_experts),
+                "per_layer": {},
             }
 
         return {
             "entropy": torch.stack(all_H).mean(),
             "load_per_expert": torch.stack(all_counts).float().mean(dim=0),
+            "per_layer": per_layer,
         }
 
     # -----------------------------------------------------------------
@@ -1913,7 +1951,7 @@ def test_nanoseek() -> None:
 
     # ---- Test 1: Forward pass shapes + finite loss ----
     model.train()
-    outputs = model(input_ids, labels=labels, tokens_processed=0, total_tokens=1000)
+    outputs = model(input_ids, labels=labels, mtp_lambda=0.3)
     assert outputs["logits"].shape == (B, S, V), (
         f"Wrong logits shape: {outputs['logits'].shape}"
     )
@@ -1961,13 +1999,13 @@ def test_nanoseek() -> None:
 
     # ---- Test 6: MTP contributes to loss ----
     model.train()
-    out_mtp = model(input_ids, labels=labels, tokens_processed=0, total_tokens=1000)
+    out_mtp = model(input_ids, labels=labels, mtp_lambda=0.3)
     print(f"  Test 6: Total loss (includes MTP + aux) = {out_mtp['loss'].item():.4f}")
     model.zero_grad()
 
     # ---- Test 7: Load balance bias update ----
-    _ = model(input_ids, labels=labels, tokens_processed=100, total_tokens=1000)
-    model.update_load_balance_bias(tokens_processed=100, total_tokens=1000)
+    _ = model(input_ids, labels=labels, mtp_lambda=0.3)
+    model.update_load_balance_bias(mtp_lambda=0.3)
     print("  Test 7: Load balance bias update — no crash")
     model.zero_grad()
 

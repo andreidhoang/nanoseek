@@ -137,7 +137,7 @@ class TestMTPWeightSharing:
         model.zero_grad()
 
         # Forward with labels (triggers _compute_loss which runs MTP)
-        out = model(batch, labels=batch, tokens_processed=0, total_tokens=1000)
+        out = model(batch, labels=batch, mtp_lambda=0.3)
         out["loss"].backward()
 
         # embed_tokens grad should be nonzero (main CE + MTP both contribute)
@@ -171,7 +171,7 @@ class TestLossDecomposition:
         model.train()
 
         # Get total loss (includes MTP)
-        out = model(batch, labels=batch, tokens_processed=0, total_tokens=1000)
+        out = model(batch, labels=batch, mtp_lambda=0.3)
         total_loss = out["loss"].item()
 
         # Compute pure CE loss manually for comparison
@@ -323,7 +323,7 @@ class TestBiasUpdate:
     def test_bias_changes_after_update(self, model, batch, cfg):
         model.train()
         # Forward to populate _layer_aux_data
-        out = model(batch, labels=batch, tokens_processed=100, total_tokens=1000)
+        out = model(batch, labels=batch, mtp_lambda=0.3)
 
         # Snapshot gate biases before update
         biases_before = {}
@@ -352,7 +352,7 @@ class TestBiasUpdate:
     def test_bias_frozen_after_95_percent(self, model, batch, cfg):
         """After 95% of training, gamma=0 → bias should NOT change."""
         model.train()
-        out = model(batch, labels=batch, tokens_processed=960, total_tokens=1000)
+        out = model(batch, labels=batch, mtp_lambda=0.1)
 
         biases_before = {}
         for i, layer in enumerate(model.layers):
@@ -414,7 +414,7 @@ class TestGradientFlow:
     def test_all_params_receive_gradients(self, model, batch):
         model.train()
         model.zero_grad()
-        out = model(batch, labels=batch, tokens_processed=0, total_tokens=1000)
+        out = model(batch, labels=batch, mtp_lambda=0.3)
         out["loss"].backward()
 
         dead_params = []
@@ -431,7 +431,7 @@ class TestGradientFlow:
     def test_no_nan_in_gradients(self, model, batch):
         model.train()
         model.zero_grad()
-        out = model(batch, labels=batch, tokens_processed=0, total_tokens=1000)
+        out = model(batch, labels=batch, mtp_lambda=0.3)
         out["loss"].backward()
 
         nan_params = []
@@ -463,7 +463,7 @@ class TestForwardContract:
 
     def test_output_keys_with_labels(self, model, batch):
         model.train()
-        out = model(batch, labels=batch, tokens_processed=0, total_tokens=1000)
+        out = model(batch, labels=batch, mtp_lambda=0.3)
         assert out["loss"] is not None
         assert out["loss"].dim() == 0, "Loss must be scalar"
         assert out["loss"].isfinite(), f"Loss is {out['loss'].item()}"
@@ -489,3 +489,95 @@ class TestForwardContract:
             assert c_kv.shape[1] == batch.shape[1], (
                 f"Layer {i} cache seq_len mismatch"
             )
+
+
+# ─── Test 11: Meta device initialization (regression for Bugs 1-3) ──────────
+
+class TestMetaDeviceInit:
+    """Verify that meta device → to_empty → init_weights produces a working model.
+
+    Regression test for the critical bugs found in gate1-smoke v1-v4:
+    - Bug 1: RMSNorm weights were zeros (should be ones)
+    - Bug 2: RoPE freqs_cis buffers were zeros (should be precomputed cos/sin)
+    - Bug 3: MTP concat_proj was zero-initialized (should be small random)
+
+    Without these fixes, loss = ln(V) exactly (perfectly uniform logits).
+    See docs/TRAINING_BUGS_POSTMORTEM.md for full details.
+    """
+
+    def test_meta_init_produces_nonrandom_loss(self, cfg):
+        """Model built via meta device must produce loss != ln(V)."""
+        import math
+        with torch.device("meta"):
+            model = NanoSeekModel(cfg)
+        model.to_empty(device="cpu")
+        model.init_weights()
+        model.train()
+
+        ln_V = math.log(cfg.vocab_size)
+        x = torch.randint(0, cfg.vocab_size, (1, 32))
+        out = model(x, labels=x, mtp_lambda=0.3)
+
+        assert abs(out["main_loss"].item() - ln_V) > 0.01, (
+            f"Main loss = {out['main_loss'].item():.4f} ≈ ln(V) = {ln_V:.4f}. "
+            "Model produces uniform logits — init is broken (zero RMSNorm or RoPE)."
+        )
+        assert abs(out["mtp_loss"].item() - ln_V) > 0.01, (
+            f"MTP loss = {out['mtp_loss'].item():.4f} ≈ ln(V) = {ln_V:.4f}. "
+            "MTP produces uniform logits — concat_proj or RoPE init is broken."
+        )
+
+    def test_rmsnorm_weights_are_ones(self, cfg):
+        """RMSNorm weights must be 1.0 after meta init, not zeros."""
+        from nanoseek.model import RMSNorm
+        with torch.device("meta"):
+            model = NanoSeekModel(cfg)
+        model.to_empty(device="cpu")
+        model.init_weights()
+
+        for name, module in model.named_modules():
+            if isinstance(module, RMSNorm):
+                assert torch.all(module.weight == 1.0), (
+                    f"{name}.weight should be ones, got mean={module.weight.mean():.4f}"
+                )
+                break  # just check first one
+
+    def test_rope_freqs_nonzero(self, cfg):
+        """RoPE freqs_cis must contain non-zero values after meta init."""
+        with torch.device("meta"):
+            model = NanoSeekModel(cfg)
+        model.to_empty(device="cpu")
+        model.init_weights()
+
+        freqs = model.layers[0].self_attn.freqs_cis
+        assert freqs.abs().sum() > 0, (
+            "freqs_cis is all zeros — _reinit_buffers() not called or broken"
+        )
+        assert freqs.real.min() >= -1.01 and freqs.real.max() <= 1.01, (
+            f"freqs_cis real part out of range: [{freqs.real.min()}, {freqs.real.max()}]"
+        )
+
+    def test_meta_matches_direct_construction(self, cfg):
+        """Meta-device and direct construction should produce similar loss ranges."""
+        import math
+        torch.manual_seed(123)
+        direct_model = NanoSeekModel(cfg)
+        direct_model.train()
+
+        torch.manual_seed(123)
+        with torch.device("meta"):
+            meta_model = NanoSeekModel(cfg)
+        meta_model.to_empty(device="cpu")
+        meta_model.init_weights()
+        meta_model.train()
+
+        ln_V = math.log(cfg.vocab_size)
+        x = torch.randint(0, cfg.vocab_size, (1, 32))
+
+        with torch.no_grad():
+            direct_out = direct_model(x, labels=x, mtp_lambda=0.3)
+            meta_out = meta_model(x, labels=x, mtp_lambda=0.3)
+
+        # Both should be non-random (different from ln_V)
+        assert abs(direct_out["main_loss"].item() - ln_V) > 0.01
+        assert abs(meta_out["main_loss"].item() - ln_V) > 0.01

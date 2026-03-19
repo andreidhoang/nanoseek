@@ -315,7 +315,7 @@ def stage_gate1(state: PipelineState, dry_run: bool, seed: int):
     result = run_training(
         "gate1-smoke", "anchor",
         ["--num-iterations", "100", "--eval-every", "50",
-         "--save-every", "100", "--device-batch-size", "16"],
+         "--save-every", "100", "--device-batch-size", "4"],
         dry_run=dry_run, seed=seed,
     )
     state.run_results["gate1-smoke"] = result

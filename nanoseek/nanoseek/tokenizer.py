@@ -383,6 +383,12 @@ class RustBPETokenizer:
 # Convenience functions
 # ============================================================================
 
+def _default_tokenizer_dir() -> str:
+    """Return the default tokenizer directory path."""
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "tokenizer")
+
+
 def get_tokenizer(tokenizer_dir: Optional[str] = None) -> RustBPETokenizer:
     """Load the NanoSeek tokenizer from a directory.
 
@@ -390,7 +396,19 @@ def get_tokenizer(tokenizer_dir: Optional[str] = None) -> RustBPETokenizer:
         tokenizer_dir: Path to tokenizer directory. If None, uses default location.
     """
     if tokenizer_dir is None:
-        # Default: look relative to this file's parent
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        tokenizer_dir = os.path.join(base, "tokenizer")
+        tokenizer_dir = _default_tokenizer_dir()
     return RustBPETokenizer.from_directory(tokenizer_dir)
+
+
+def get_token_bytes(device: str = "cpu", tokenizer_dir: Optional[str] = None):
+    """Load precomputed token byte-lengths for BPB evaluation.
+
+    Returns a [vocab_size] int32 tensor where entry i = number of UTF-8 bytes
+    that token i decodes to (0 for special tokens).
+    """
+    import torch
+    if tokenizer_dir is None:
+        tokenizer_dir = _default_tokenizer_dir()
+    path = os.path.join(tokenizer_dir, "token_bytes.pt")
+    with open(path, "rb") as f:
+        return torch.load(f, map_location=device, weights_only=True)

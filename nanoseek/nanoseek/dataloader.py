@@ -21,8 +21,8 @@ import random
 import torch
 import pyarrow.parquet as pq
 
-from nanoseek.common import get_dist_info
-from nanoseek.dataset import list_parquet_files
+from nanoseek.nanoseek.common import get_dist_info
+from nanoseek.nanoseek.dataset import list_parquet_files
 
 
 def fim_transform(tokens, fim_rate, fim_tokens, rng):

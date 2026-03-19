@@ -7,8 +7,12 @@ Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from torch import Tensor
+
+# MoE models have many shape groups — increase recompilation limit for fused kernels
+torch._dynamo.config.cache_size_limit = 32
 
 # -----------------------------------------------------------------------------
 """
@@ -266,7 +270,8 @@ class MuonAdamW(torch.optim.Optimizer):
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
+        # MoE: unused experts may have None grads — treat as zero
+        stacked_grads = torch.stack([p.grad if p.grad is not None else torch.zeros_like(p) for p in params])
         stacked_params = torch.stack(params)
 
         # Fill all the 0-D tensors with current values

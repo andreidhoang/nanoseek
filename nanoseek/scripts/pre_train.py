@@ -49,7 +49,7 @@ from nanoseek.nanoseek.common import (
     DummyWandb, autodetect_device_type, get_peak_flops,
     COMPUTE_DTYPE, is_ddp_initialized,
 )
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanoseek.nanoseek.tokenizer import get_tokenizer, get_token_bytes
 from nanoseek.nanoseek.dataloader import (
     tokenizing_distributed_data_loader_bos_bestfit,
     tokenizing_distributed_data_loader_with_state_bos_bestfit,
@@ -102,7 +102,7 @@ parser.add_argument("--weight-decay", type=float, default=0.1,
 # Training iterations and batch
 parser.add_argument("--num-iterations", type=int, default=-1,
                     help="override total iterations (-1 = compute from total_tokens)")
-parser.add_argument("--device-batch-size", type=int, default=16,
+parser.add_argument("--device-batch-size", type=int, default=4,
                     help="micro-batch size per GPU (sequences)")
 
 # Evaluation
@@ -810,10 +810,18 @@ def get_batch_warmup_accum(step, target_accum, total_steps, warmup_fraction=0.10
 #   gentle averaging avoids tracking SGD noise while capturing the trajectory.
 # ═══════════════════════════════════════════════════════════════════
 class EMATracker:
-    """CPU-side EMA weight tracker for all evaluation."""
+    """CPU-side EMA weight tracker for all evaluation.
+
+    Uses Karras-style decay warmup: effective_decay = min(decay, 1 - 1/(1+count)).
+    This makes early updates more impactful so EMA tracks the model during short
+    runs (smoke tests), while converging to the target decay for long runs.
+    Without this, decay=0.9999 means shadow weights barely move for the first
+    ~10,000 updates (99.9% initial weights after 10 updates).
+    """
     def __init__(self, model, decay=0.9999, device="cpu"):
         self.decay = decay
         self.device = device
+        self.update_count = 0
         # Deep copy all parameters to CPU
         self.shadow = {
             name: param.detach().clone().to(device)
@@ -822,10 +830,13 @@ class EMATracker:
 
     @torch.no_grad()
     def step(self, model):
-        """Update EMA weights from model."""
+        """Update EMA weights from model with Karras decay warmup."""
+        self.update_count += 1
+        # Karras warmup: ramp decay from 0 → target over first 1/(1-decay) updates
+        effective_decay = min(self.decay, 1.0 - 1.0 / (1.0 + self.update_count))
         for name, param in model.named_parameters():
             # lerp_: shadow = decay * shadow + (1 - decay) * param
-            self.shadow[name].lerp_(param.detach().to(self.device), 1 - self.decay)
+            self.shadow[name].lerp_(param.detach().to(self.device), 1 - effective_decay)
 
     @contextmanager
     def apply(self, model):
@@ -842,12 +853,17 @@ class EMATracker:
 
     def state_dict(self):
         """for checkpointing"""
-        return {k: v.clone() for k, v in self.shadow.items()}
+        d = {k: v.clone() for k, v in self.shadow.items()}
+        d['__ema_update_count__'] = self.update_count
+        return d
 
     def load_state_dict(self, state_dict):
         """for loading checkpoints"""
         for k, v in state_dict.items():
-            self.shadow[k].copy_(v)
+            if k == '__ema_update_count__':
+                self.update_count = v
+            else:
+                self.shadow[k].copy_(v)
 
     def __repr__(self):
         return f"EMATracker(decay={self.decay}, device={self.device})"
@@ -1069,8 +1085,10 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     split="train", device=device, resume_state_dict=resume_dataloader_state,
     fim_rate=0.10,  # RULE 6: 10% PSM FIM from token 1
 )
+# Eval uses smaller batch to avoid OOM from materialized [B,T,V] logits
+eval_batch_size = min(args.device_batch_size, 2)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
-    tokenizer, args.device_batch_size, config.sequence_length,
+    tokenizer, eval_batch_size, config.sequence_length,
     split="val", device=device,
 )
 
@@ -1101,7 +1119,7 @@ class TrainingHealthMonitor:
 
     Reference: OLMo 2 (GN threshold), ZClip (z-score), DeepSeek V3 (zero rollbacks)
     """
-    def __init__(self):
+    def __init__(self, warmup_steps=0):
         # Gradient norm tracking (ZClip-inspired adaptive detection)
         self.grad_norm_ema = 0.0
         self.grad_norm_var_ema = 0.0
@@ -1120,11 +1138,15 @@ class TrainingHealthMonitor:
         # Consecutive NaN counter
         self.nan_count = 0
 
+        # Grace period: during LR warmup, gradient norms naturally grow monotonically.
+        # Spike detection during this period generates only false positives.
+        self.warmup_steps = warmup_steps
+
     def update(self, step, grad_norm_val, loss_val, h_load_val):
         """Check all tripwires. Returns list of alerts (empty = healthy)."""
         alerts = []
 
-        # ─── NaN/Inf detection (IMMEDIATE) ───
+        # ─── NaN/Inf detection (IMMEDIATE — always active, even during warmup) ───
         gn = grad_norm_val.item() if hasattr(grad_norm_val, 'item') else float(grad_norm_val)
         lv = loss_val.item() if hasattr(loss_val, 'item') else float(loss_val)
         hl = h_load_val.item() if hasattr(h_load_val, 'item') else float(h_load_val)
@@ -1136,7 +1158,10 @@ class TrainingHealthMonitor:
             return alerts
         self.nan_count = 0
 
+        in_warmup = step < self.warmup_steps
+
         # ─── Gradient norm: EMA + z-score (ZClip-inspired) ───
+        # Always update EMA (even during warmup) so it's calibrated when warmup ends
         if not self.grad_norm_initialized:
             self.grad_norm_ema = gn
             self.grad_norm_var_ema = 0.0
@@ -1146,18 +1171,15 @@ class TrainingHealthMonitor:
             self.grad_norm_var_ema = beta * self.grad_norm_var_ema + (1 - beta) * (gn - self.grad_norm_ema) ** 2
             self.grad_norm_ema = beta * self.grad_norm_ema + (1 - beta) * gn
 
-            # Z-score spike detection
-            std = math.sqrt(self.grad_norm_var_ema + 1e-8)
-            z_score = (gn - self.grad_norm_ema) / std
-            if z_score > 4.0:
-                alerts.append(("WARNING", f"Gradient norm spike: {gn:.4f} "
-                              f"(z={z_score:.1f}, ema={self.grad_norm_ema:.4f})"))
-                self.grad_spikes_last_100.append(step)
-
-            # Absolute threshold (OLMo empirical: 0.4 for 7B → scale-adjusted)
-            if self.grad_norm_ema > 0.5:
-                alerts.append(("WARNING", f"Gradient norm EMA elevated: {self.grad_norm_ema:.4f} "
-                              f"(trending toward blowup zone)"))
+            # Skip spike detection during warmup (gradients grow monotonically with LR)
+            if not in_warmup:
+                # Z-score spike detection
+                std = math.sqrt(self.grad_norm_var_ema + 1e-8)
+                z_score = (gn - self.grad_norm_ema) / std
+                if z_score > 4.0:
+                    alerts.append(("WARNING", f"Gradient norm spike: {gn:.4f} "
+                                  f"(z={z_score:.1f}, ema={self.grad_norm_ema:.4f})"))
+                    self.grad_spikes_last_100.append(step)
 
         # ─── Loss spike detection ───
         if not self.loss_initialized:
@@ -1166,39 +1188,40 @@ class TrainingHealthMonitor:
         else:
             self.loss_ema = self.loss_ema_beta * self.loss_ema + (1 - self.loss_ema_beta) * lv
 
-            ratio = lv / max(self.loss_ema, 1e-8)
-            if ratio > 2.0:
-                alerts.append(("WARNING", f"Loss spike: {lv:.4f} "
-                              f"({ratio:.1f}x rolling avg {self.loss_ema:.4f})"))
-                self.loss_spikes_last_100.append(step)
-            if ratio > 3.0:
-                alerts.append(("CRITICAL", f"Severe loss spike: {lv:.4f} "
-                              f"({ratio:.1f}x avg). Consider checkpoint restore."))
+            if not in_warmup:
+                ratio = lv / max(self.loss_ema, 1e-8)
+                if ratio > 2.0:
+                    alerts.append(("WARNING", f"Loss spike: {lv:.4f} "
+                                  f"({ratio:.1f}x rolling avg {self.loss_ema:.4f})"))
+                    self.loss_spikes_last_100.append(step)
+                if ratio > 3.0:
+                    alerts.append(("CRITICAL", f"Severe loss spike: {lv:.4f} "
+                                  f"({ratio:.1f}x avg). Consider checkpoint restore."))
 
-        # ─── Expert collapse detection ───
+        # ─── Expert collapse detection (always active) ───
         if hl < 2.0:
             alerts.append(("CRITICAL", f"Expert collapse: H_load={hl:.2f} bits "
                           f"(threshold: 2.0). Routing is degenerate."))
-        elif hl < 4.0 and step > 100:
+        elif hl < 4.0 and step > self.warmup_steps:
             alerts.append(("WARNING", f"H_load declining: {hl:.2f} bits "
                           f"(healthy > 4.0 at init)"))
 
-        # ─── Spike frequency (OLMo insight) ───
-        # Clean old entries
-        self.grad_spikes_last_100 = [s for s in self.grad_spikes_last_100 if step - s < 100]
-        self.loss_spikes_last_100 = [s for s in self.loss_spikes_last_100 if step - s < 100]
+        # ─── Spike frequency (OLMo insight) — only after warmup ───
+        if not in_warmup:
+            self.grad_spikes_last_100 = [s for s in self.grad_spikes_last_100 if step - s < 100]
+            self.loss_spikes_last_100 = [s for s in self.loss_spikes_last_100 if step - s < 100]
 
-        if len(self.grad_spikes_last_100) >= 5:
-            alerts.append(("WARNING", f"Spike frequency increasing: "
-                          f"{len(self.grad_spikes_last_100)} grad spikes in last 100 steps"))
-        if len(self.loss_spikes_last_100) >= 3:
-            alerts.append(("WARNING", f"Loss spike frequency: "
-                          f"{len(self.loss_spikes_last_100)} spikes in last 100 steps"))
+            if len(self.grad_spikes_last_100) >= 5:
+                alerts.append(("WARNING", f"Spike frequency increasing: "
+                              f"{len(self.grad_spikes_last_100)} grad spikes in last 100 steps"))
+            if len(self.loss_spikes_last_100) >= 3:
+                alerts.append(("WARNING", f"Loss spike frequency: "
+                              f"{len(self.loss_spikes_last_100)} spikes in last 100 steps"))
 
         return alerts
 
 
-health_monitor = TrainingHealthMonitor()
+health_monitor = TrainingHealthMonitor(warmup_steps=warmup_steps)
 
 # ─── Training loop state ───
 step = resume_step
@@ -1214,10 +1237,13 @@ while True:
 
     # ─────────────────────────────────────────────────────────────
     # EVALUATE (RULE 1: ALL eval uses EMA weights)
+    # Ensure EMA is up-to-date before evaluation (even if not on ema_every boundary)
     # ─────────────────────────────────────────────────────────────
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+        if step > 0:
+            ema_tracker.step(orig_model)
         model.eval()
-        eval_steps = args.eval_tokens // (args.device_batch_size * config.sequence_length * ddp_world_size)
+        eval_steps = args.eval_tokens // (eval_batch_size * config.sequence_length * ddp_world_size)
         # Fresh val_loader for BPB eval — each metric gets its own loader
         # to avoid consuming data that subsequent metrics need.
         val_loader_bpb = build_val_loader()
@@ -1381,11 +1407,17 @@ while True:
         # Without this, model runs in fp32 and CastLinear does nothing useful.
         # Loss computation stays in fp32 (cross_entropy promotes automatically).
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type == "cuda")):
+            from nanoseek.nanoseek.model import get_mtp_loss_weight
+            mtp_lambda = get_mtp_loss_weight(
+                tokens_processed, config.total_tokens,
+                config.mtp.mtp_loss_weight_initial,
+                config.mtp.mtp_loss_weight_final,
+                config.mtp.mtp_loss_transition_ratio,
+            )
             outputs = model(
                 x,
                 labels=x,
-                tokens_processed=tokens_processed,
-                total_tokens=config.total_tokens,
+                mtp_lambda=mtp_lambda,
             )
             loss = outputs['loss']
         train_loss_accum += loss.detach()

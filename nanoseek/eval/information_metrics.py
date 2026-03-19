@@ -124,8 +124,8 @@ def compute_i_spec(
     i_spec_per_layer = []
 
     for layer_idx in range(n_layers):
-        router_input = collector.router_inputs[layer_idx].numpy()  # [N, D]
-        expert_idx = collector.expert_indices[layer_idx].numpy()    # [N, K]
+        router_input = collector.router_inputs[layer_idx].float().numpy()  # [N, D]
+        expert_idx = collector.expert_indices[layer_idx].int().numpy()    # [N, K]
 
         N = router_input.shape[0]
         if N < n_clusters:
@@ -143,7 +143,8 @@ def compute_i_spec(
                 if 0 <= e < n_experts:
                     expert_counts[e] += 1
         expert_probs = expert_counts / max(expert_counts.sum(), 1)
-        h_expert = -np.sum(p * np.log(p + 1e-10) for p in expert_probs if p > 0)
+        nonzero = expert_probs[expert_probs > 0]
+        h_expert = -np.sum(nonzero * np.log(nonzero + 1e-10))
 
         # H(expert | cluster): conditional entropy
         h_expert_given_cluster = 0.0
@@ -158,7 +159,8 @@ def compute_i_spec(
                     if 0 <= e < n_experts:
                         cluster_expert_counts[e] += 1
             cluster_probs = cluster_expert_counts / max(cluster_expert_counts.sum(), 1)
-            h_c = -sum(p * np.log(p + 1e-10) for p in cluster_probs if p > 0)
+            nz = cluster_probs[cluster_probs > 0]
+            h_c = -np.sum(nz * np.log(nz + 1e-10))
             h_expert_given_cluster += (n_c / N) * h_c
 
         i_spec = h_expert - h_expert_given_cluster

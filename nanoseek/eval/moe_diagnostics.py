@@ -62,9 +62,9 @@ def compute_dead_experts(
             counts = layer_data.get("load_counts", None)
             if counts is not None:
                 if layer_idx not in all_layer_counts:
-                    all_layer_counts[layer_idx] = counts.clone().float()
+                    all_layer_counts[layer_idx] = counts.detach().clone().float().cpu()
                 else:
-                    all_layer_counts[layer_idx] += counts.float()
+                    all_layer_counts[layer_idx] += counts.detach().float().cpu()
 
         if tokens_processed >= n_tokens:
             break
@@ -74,7 +74,7 @@ def compute_dead_experts(
         aggregate = model.get_expert_load_stats()
         counts = aggregate.get("load_per_expert", None)
         if counts is not None:
-            all_layer_counts[0] = counts.float()
+            all_layer_counts[0] = counts.detach().float().cpu()
 
     results = {
         'dead_experts_per_layer': {},
@@ -102,7 +102,7 @@ def compute_dead_experts(
         results['total_dead_count'] += len(dead_indices)
 
         # Gini coefficient of expert utilization
-        gini = _gini_coefficient(fractions.numpy())
+        gini = _gini_coefficient(fractions.float().cpu().numpy())
         results['utilization_gini_per_layer'][layer_idx] = round(gini, 4)
 
     if results['total_dead_count'] > 0:
