@@ -17,6 +17,8 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 """
 
 import random
+import threading
+from queue import Queue
 
 import torch
 import pyarrow.parquet as pq
@@ -157,14 +159,26 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     # This gives us contiguous views and a single HtoD transfer
     use_cuda = device == "cuda"
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
-    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
 
-    while True:
+    # ─── Double-buffered prefetch (PERF: overlap CPU packing + GPU training) ───
+    # Without this, the GPU idles while the CPU packs the next batch (and vice versa).
+    # With double buffering, a background thread packs batch N+1 into cpu_buf_B
+    # while the GPU trains on batch N (already copied from cpu_buf_A).
+    # Python GIL releases during tokenizer.encode() (Rust FFI) and torch.tensor(),
+    # so the background thread genuinely runs in parallel with the main thread.
+    cpu_buf_A = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    cpu_buf_B = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    prefetch_queue = Queue(maxsize=2)
+
+    def _pack_one_batch(cpu_buffer):
+        """Pack a full batch into the given CPU buffer. Runs in background thread."""
+        nonlocal pq_idx, rg_idx, epoch, fim_count, total_count
+        cpu_inputs = cpu_buffer[:B * T].view(B, T)
+        cpu_targets = cpu_buffer[B * T:].view(B, T)
+
         for row_idx in range(B):
             pos = 0
             while pos < row_capacity:
@@ -195,20 +209,41 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        # Copy to pinned CPU buffer, then single HtoD transfer
+        # Copy to pinned CPU buffer
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
 
         # Save FIM RNG state so it can be restored on resume.
-        # random.getstate() returns (version, internalstate, gauss_next) —
-        # all JSON-serializable (ints, tuples of ints, float).
         fim_rng_state = list(fim_rng.getstate()) if use_fim else None
-        # Convert internal state tuple to list for JSON serialization
         if fim_rng_state is not None:
             fim_rng_state[1] = list(fim_rng_state[1])
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch,
                       "fim_fraction": fim_count / max(total_count, 1),
                       "fim_rng_state": fim_rng_state}
+
+        return cpu_buffer, state_dict
+
+    def _prefetch_worker():
+        """Background thread: alternately packs batches into cpu_buf_A and cpu_buf_B."""
+        batch_num = 0
+        try:
+            while True:
+                buf = cpu_buf_A if (batch_num % 2 == 0) else cpu_buf_B
+                cpu_buffer, state_dict = _pack_one_batch(buf)
+                prefetch_queue.put((cpu_buffer, state_dict))
+                batch_num += 1
+        except Exception as e:
+            # Propagate exception to main thread via queue
+            prefetch_queue.put(e)
+
+    worker = threading.Thread(target=_prefetch_worker, daemon=True)
+    worker.start()
+
+    while True:
+        result = prefetch_queue.get()
+        if isinstance(result, Exception):
+            raise result
+        cpu_buffer, state_dict = result
 
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)

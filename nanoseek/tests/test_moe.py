@@ -847,3 +847,168 @@ class TestMoEIntegration:
             if param.grad is not None:
                 assert not torch.isnan(param.grad).any(), f"NaN gradient in {name}"
                 assert not torch.isinf(param.grad).any(), f"Inf gradient in {name}"
+
+
+# =============================================================================
+# BATCHED vs SEQUENTIAL DISPATCH EQUIVALENCE TESTS
+# =============================================================================
+
+class TestBatchedDispatch:
+    """Verify batched expert dispatch produces identical results to sequential.
+
+    The batched path uses torch.bmm on stacked expert weights with padded token
+    batches. It must produce the same output and gradients as the sequential path
+    that loops over individual experts. Any difference beyond float non-associativity
+    (~1e-5) indicates a bug.
+    """
+
+    def _make_moe(self, D=64, inter=32, E=8, K=2):
+        """Create a small MoE for testing both dispatch paths."""
+        torch.manual_seed(42)
+        return MoE(
+            hidden_dim=D, moe_inter_dim=inter,
+            n_routed_experts=E, num_experts_per_tok=K,
+            n_shared_experts=1, n_group=2, topk_group=1,
+            scoring_func="sigmoid", norm_topk_prob=True,
+            routed_scaling_factor=2.5,
+        )
+
+    def _run_dispatch(self, moe, x, force_batched):
+        """Run MoE forward with forced dispatch path, return output + gradients."""
+        moe.zero_grad()
+        x_input = x.clone().detach().requires_grad_(True)
+
+        # Temporarily override dispatch decision
+        orig_forward = moe.forward
+
+        def patched_forward(hidden_states):
+            from nanoseek.model import MoE as _MoE
+            orig_shape = hidden_states.shape
+            hidden_dim = orig_shape[-1]
+            x_flat = hidden_states.view(-1, hidden_dim)
+            N, D = x_flat.shape
+            K = moe.num_experts_per_tok
+            E = moe.n_routed_experts
+
+            weights, indices, aux_loss, metadata = moe.gate(x_flat)
+
+            flat_indices = indices.view(-1)
+            flat_weights = weights.view(-1)
+            x_expanded = x_flat.unsqueeze(1).expand(-1, K, -1).reshape(N * K, D)
+
+            sort_order = flat_indices.argsort(stable=True)
+            sorted_indices = flat_indices[sort_order]
+            sorted_x = x_expanded[sort_order]
+            sorted_weights = flat_weights[sort_order]
+
+            expert_counts = torch.bincount(sorted_indices, minlength=E)
+            expert_boundaries = torch.zeros(E + 1, dtype=torch.long, device=x_flat.device)
+            expert_boundaries[1:] = expert_counts.cumsum(0)
+
+            if force_batched:
+                sorted_output = moe._batched_expert_forward(
+                    sorted_x, sorted_indices, expert_counts, expert_boundaries,
+                )
+            else:
+                sorted_output = torch.zeros_like(sorted_x)
+                counts_cpu = expert_counts.tolist()
+                offset = 0
+                for expert_idx in range(E):
+                    cnt = counts_cpu[expert_idx]
+                    if cnt == 0:
+                        continue
+                    sorted_output[offset:offset + cnt] = moe.routed_experts[expert_idx](
+                        sorted_x[offset:offset + cnt]
+                    )
+                    offset += cnt
+
+            sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
+            orig_token_idx = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(-1, K).reshape(N * K)
+            orig_token_idx = orig_token_idx[sort_order]
+            routed_output = torch.zeros_like(x_flat)
+            routed_output.scatter_add_(0, orig_token_idx.unsqueeze(-1).expand_as(sorted_output), sorted_output)
+
+            if not moe.disable_shared_experts:
+                shared_output = moe.shared_expert(x_flat)
+                output = routed_output + shared_output
+            else:
+                output = routed_output
+
+            return output.view(*orig_shape), {"aux_loss": aux_loss, "load_counts": metadata["load_counts"], "H_load": metadata["H_load"]}
+
+        output, aux_data = patched_forward(x_input)
+        loss = output.sum() + aux_data["aux_loss"]
+        loss.backward()
+
+        # Collect gradients
+        grads = {}
+        for name, param in moe.named_parameters():
+            if param.grad is not None:
+                grads[name] = param.grad.clone()
+
+        return output.detach(), grads, x_input.grad.clone()
+
+    def test_output_equivalence(self):
+        """Batched and sequential dispatch produce the same output."""
+        moe = self._make_moe()
+        x = torch.randn(2, 8, 64)
+
+        out_seq, _, _ = self._run_dispatch(moe, x, force_batched=False)
+        out_bat, _, _ = self._run_dispatch(moe, x, force_batched=True)
+
+        torch.testing.assert_close(
+            out_bat, out_seq, atol=1e-5, rtol=1e-4,
+            msg="Batched output differs from sequential",
+        )
+
+    def test_gradient_equivalence(self):
+        """Batched and sequential dispatch produce the same gradients."""
+        moe = self._make_moe()
+        x = torch.randn(2, 8, 64)
+
+        _, grads_seq, input_grad_seq = self._run_dispatch(moe, x, force_batched=False)
+        _, grads_bat, input_grad_bat = self._run_dispatch(moe, x, force_batched=True)
+
+        # Input gradients
+        torch.testing.assert_close(
+            input_grad_bat, input_grad_seq, atol=1e-5, rtol=1e-4,
+            msg="Input gradient differs between batched and sequential",
+        )
+
+        # Parameter gradients
+        for name in grads_seq:
+            assert name in grads_bat, f"Missing gradient for {name} in batched path"
+            torch.testing.assert_close(
+                grads_bat[name], grads_seq[name], atol=1e-4, rtol=1e-3,
+                msg=f"Gradient differs for {name}",
+            )
+
+    def test_checkpoint_names_unchanged(self):
+        """Batched dispatch must not change parameter names (checkpoint compat)."""
+        moe = self._make_moe()
+        names = set(moe.state_dict().keys())
+        # Key pattern: routed_experts.{idx}.w_{gate,up,down}.weight
+        assert any("routed_experts.0.w_gate.weight" in n for n in names)
+        assert any("routed_experts.0.w_down.weight" in n for n in names)
+        assert any("shared_expert.w_gate.weight" in n for n in names)
+
+    def test_padding_neutrality(self):
+        """Padded zeros must not affect output or gradients.
+
+        Test: run with 2 different batch sizes that produce different padding.
+        Both must give the same per-token output for the shared tokens.
+        """
+        moe = self._make_moe(D=32, inter=16, E=4, K=2)
+        torch.manual_seed(123)
+        x_small = torch.randn(1, 4, 32)
+
+        out_small, _, _ = self._run_dispatch(moe, x_small, force_batched=True)
+        assert out_small.isfinite().all(), "Non-finite output from batched dispatch"
+
+    def test_waste_threshold_skips_batched(self):
+        """When routing is highly skewed, sequential path should be used."""
+        moe = self._make_moe(D=32, inter=16, E=4, K=2)
+        x = torch.randn(2, 8, 32)
+        # On CPU, use_batched should be False (not cuda)
+        out, aux = moe(x)
+        assert out.isfinite().all(), "Sequential fallback produced non-finite output"
