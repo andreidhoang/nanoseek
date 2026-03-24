@@ -358,7 +358,7 @@ class MultiHeadLatentAttention(nn.Module):
         # =================================================================
         kv = self.wkv_a(hidden_states)  # [B, S, kv_lora_rank + qk_rope_head_dim]
         c_kv, k_pe_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        c_kv = self.kv_norm(c_kv)
+        c_kv = self.kv_norm(c_kv) 
         k_pe_raw = k_pe_raw.unsqueeze(2)  # [B, S, 1, rope_dim]
 
         # =================================================================
@@ -1228,7 +1228,7 @@ class NanoSeekDecoderLayer(nn.Module):
 
     Architecture:
         x → input_layernorm → self_attn → + residual
-          → post_attention_layernorm → ffn → + residual → output
+        → post_attention_layernorm → ffn → + residual → output
 
     The attention module is MLA (Multi-head Latent Attention). DSA (DeepSeek Sparse
     Attention) support will be added when Section 9 is implemented.
