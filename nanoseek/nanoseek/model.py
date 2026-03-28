@@ -19,6 +19,34 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
+# ─── NVTX Profiling ──────────────────────────────────────────────────────────
+# Module-level toggle. Zero cost when disabled (function calls are no-ops).
+# Enable from training script: `import nanoseek.nanoseek.model as M; M.enable_nvtx()`
+# Then run: `nsys profile -t cuda,nvtx ...` or `ncu --nvtx --nvtx-include "moe/" ...`
+_nvtx_enabled = False
+try:
+    import torch.cuda.nvtx as _nvtx
+except ImportError:
+    _nvtx = None
+
+def enable_nvtx():
+    """Enable NVTX markers in model forward passes."""
+    global _nvtx_enabled
+    _nvtx_enabled = True
+
+def disable_nvtx():
+    """Disable NVTX markers."""
+    global _nvtx_enabled
+    _nvtx_enabled = False
+
+def _nvtx_push(name: str):
+    if _nvtx_enabled and _nvtx is not None:
+        _nvtx.range_push(name)
+
+def _nvtx_pop():
+    if _nvtx_enabled and _nvtx is not None:
+        _nvtx.range_pop()
+
 # Import configurations from config.py
 # Handle both package import and direct execution
 try:
@@ -349,17 +377,23 @@ class MultiHeadLatentAttention(nn.Module):
         # =================================================================
         # QUERY PATH (shared between both modes)
         # =================================================================
+        _nvtx_push("mla/q_path")
         q = self.wq_b(self.q_norm(self.wq_a(hidden_states)))  # [B, S, n_heads * qk_head_dim]
         q = q.view(batch_size, seq_len, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
+        _nvtx_pop()  # mla/q_path
+
         # =================================================================
         # KV PATH (shared between both modes)
         # =================================================================
+        _nvtx_push("mla/kv_path")
         kv = self.wkv_a(hidden_states)  # [B, S, kv_lora_rank + qk_rope_head_dim]
         c_kv, k_pe_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         c_kv = self.kv_norm(c_kv) 
         k_pe_raw = k_pe_raw.unsqueeze(2)  # [B, S, 1, rope_dim]
+
+        _nvtx_pop()  # mla/kv_path
 
         # =================================================================
         # ROPE + CACHE (shared between both modes)
@@ -461,6 +495,7 @@ class MultiHeadLatentAttention(nn.Module):
             v = v.transpose(1, 2)
 
             # Use SDPA when available (FlashAttention / memory-efficient kernels)
+            _nvtx_push("mla/sdpa")
             use_sdpa = hasattr(F, "scaled_dot_product_attention")
 
             # PERF: Use is_causal=True instead of building an explicit mask tensor.
@@ -494,10 +529,14 @@ class MultiHeadLatentAttention(nn.Module):
                     attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=True)
                 attn_output = torch.matmul(attn_weights, v)
 
+            _nvtx_pop()  # mla/sdpa
+
             # Output projection
+            _nvtx_push("mla/o_proj")
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.v_head_dim)
             output = self.wo(attn_output)
+            _nvtx_pop()  # mla/o_proj
 
         return output, present_key_value
 
@@ -777,10 +816,16 @@ class MoE(nn.Module):
         # ── Batched SwiGLU: 2 bmm calls instead of 192 individual matmuls ──
         # F.linear(x, W) computes x @ W.T, so bmm equivalent is:
         #   padded_input @ w_gate_up.transpose(1,2)
+        _nvtx_push("moe/bmm_gate_up")
         gate_up_out = torch.bmm(padded_input, w_gate_up.transpose(1, 2))  # [E, max_count, 2*inter]
+        _nvtx_pop()
+        _nvtx_push("moe/swiglu")
         gate_out, up_out = gate_up_out.chunk(2, dim=-1)                   # each [E, max_count, inter]
         hidden = F.silu(gate_out) * up_out                                # [E, max_count, inter]
+        _nvtx_pop()
+        _nvtx_push("moe/bmm_down")
         out = torch.bmm(hidden, w_down.transpose(1, 2))                   # [E, max_count, D]
+        _nvtx_pop()
 
         # ── Vectorized unpad: gather valid outputs back to [N*K, D] ──
         sorted_output = out[sorted_indices, position_in_expert]
@@ -802,7 +847,9 @@ class MoE(nn.Module):
         x = hidden_states.view(-1, hidden_dim)  # [N, D] where N = B*S
 
         # Route tokens
+        _nvtx_push("moe/gate")
         weights, indices, aux_loss, metadata = self.gate(x)
+        _nvtx_pop()  # moe/gate
         # weights: [N, K], indices: [N, K]
 
         # Scatter-based expert dispatch: sort tokens by expert for coalesced access
@@ -814,6 +861,7 @@ class MoE(nn.Module):
         E = self.n_routed_experts
 
         # Flatten [N, K] → [N*K] and expand inputs to match
+        _nvtx_push("moe/dispatch")
         flat_indices = indices.view(-1)           # [N*K]
         flat_weights = weights.view(-1)           # [N*K]
         x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(N * K, D)  # [N*K, D]
@@ -828,6 +876,8 @@ class MoE(nn.Module):
         expert_counts = torch.bincount(sorted_indices, minlength=E)  # [E]
         expert_boundaries = torch.zeros(E + 1, dtype=torch.long, device=x.device)
         expert_boundaries[1:] = expert_counts.cumsum(0)
+
+        _nvtx_pop()  # moe/dispatch
 
         # ── Expert dispatch: batched (GPU) or sequential (CPU) ──
         # Batched dispatch uses torch.bmm to process all experts in 2 kernel launches
@@ -844,6 +894,7 @@ class MoE(nn.Module):
             and waste_ratio < 1.5  # skip if >50% padding waste (skewed routing)
         )
 
+        _nvtx_push("moe/expert_compute")
         if use_batched:
             sorted_output = self._batched_expert_forward(
                 sorted_x, sorted_indices, expert_counts, expert_boundaries,
@@ -861,8 +912,10 @@ class MoE(nn.Module):
                 expert_input = sorted_x[offset:offset + cnt]
                 sorted_output[offset:offset + cnt] = self.routed_experts[expert_idx](expert_input)
                 offset += cnt
+        _nvtx_pop()  # moe/expert_compute
 
         # Apply weights and scatter back to original token order
+        _nvtx_push("moe/combine")
         sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
 
         # Unsort and reduce: accumulate weighted outputs back to [N, D]
@@ -872,6 +925,7 @@ class MoE(nn.Module):
 
         routed_output = torch.zeros_like(x)  # [N, D]
         routed_output.scatter_add_(0, orig_token_idx.unsqueeze(-1).expand_as(sorted_output), sorted_output)
+        _nvtx_pop()  # moe/combine
 
         # Shared expert — processes ALL tokens (unless ablation-disabled)
         if self.disable_shared_experts:
@@ -1625,7 +1679,9 @@ class NanoSeekModel(nn.Module):
         # would collapse embedding scale to unit norm regardless of width,
         # breaking muP's assumption that embedding output scale = O(1) naturally.
         # Embedding init std = 1/√hidden_size already controls the scale.
+        _nvtx_push("embedding")
         hidden_states = self.embed_tokens(input_ids)  # [B, S, H]
+        _nvtx_pop()
 
         # 2. Position IDs — only auto-compute for cached generation.
         # When past_key_values is None, leave position_ids=None so MLA's
@@ -1646,6 +1702,7 @@ class NanoSeekModel(nn.Module):
         self._layer_aux_data = {}  # Reset for this forward pass
 
         for i, layer in enumerate(self.layers):
+            _nvtx_push(f"layer/{i}")
             past_kv = past_key_values[i] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training and i in self._checkpoint_layer_ids:
@@ -1668,6 +1725,8 @@ class NanoSeekModel(nn.Module):
                     use_cache=use_cache,
                 )
 
+            _nvtx_pop()  # layer/i
+
             if use_cache and present_key_values is not None:
                 present_key_values.append(present_kv)
 
@@ -1678,9 +1737,12 @@ class NanoSeekModel(nn.Module):
                 self._layer_aux_data[i] = aux_data
 
         # 4. Final norm
+        _nvtx_push("final_norm")
         hidden_states = self.norm(hidden_states)  # [B, S, H]
+        _nvtx_pop()
 
         # 5. LM head + logit softcap
+        _nvtx_push("lm_head")
         logits = self.lm_head(hidden_states)  # [B, S, padded_V]
         logits = logits[..., :self.config.vocab_size]  # Slice off padding rows
         if self.logit_softcap > 0.0:
@@ -1689,6 +1751,8 @@ class NanoSeekModel(nn.Module):
             logits = logits.float()
             logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             logits = logits.to(hidden_states.dtype)
+
+        _nvtx_pop()  # lm_head
 
         # 6. Loss computation
         loss = None

@@ -168,6 +168,13 @@ parser.add_argument("--total-tokens", type=int, default=-1,
 parser.add_argument("--hidden-size", type=int, default=-1,
                     help="Override hidden_size (for scaling sweep configs)")
 
+# ─── Profiling ───
+parser.add_argument("--profile", action="store_true",
+                    help="Enable torch.profiler + NVTX for Nsight. Profiles steps 6-15 "
+                         "then exits. Use with: nsys profile -t cuda,nvtx python -m ...")
+parser.add_argument("--profile-steps", type=int, default=10,
+                    help="Number of steps to profile (default: 10)")
+
 # ─── Config from YAML ───
 parser.add_argument("--config-yaml", type=str, default="",
                     help="Path to YAML config file (overrides individual CLI flags)")
@@ -452,6 +459,12 @@ with torch.device("meta"):
 # Move to device and initialize
 model.to_empty(device=device)
 model.init_weights()
+
+# ─── Profiling setup ───
+if args.profile:
+    import nanoseek.nanoseek.model as _model_module
+    _model_module.enable_nvtx()
+    print0("NVTX markers enabled for Nsight profiling")
 
 # ─── Parameter counts ───
 param_counts = model.num_parameters()
@@ -1658,6 +1671,12 @@ while True:
     )
     current_batch_tokens = world_tokens_per_fwdbwd * current_accum
 
+    # ─── Profiling: early exit after profiled steps ───
+    if args.profile and step > 5 + args.profile_steps:
+        print0(f"\nProfile complete ({args.profile_steps} steps profiled).")
+        print0("View with: nsys-ui <file>.nsys-rep  |  ncu-ui <file>.ncu-rep")
+        break
+
     synchronize()
     t0 = time.time()
 
@@ -1705,6 +1724,8 @@ while True:
         # Loss computation stays in fp32 (cross_entropy promotes automatically).
         if _use_cuda_events:
             _evt_fwd_start.record()
+        if args.profile:
+            _model_module._nvtx_push(f"forward/micro{micro_step}")
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type == "cuda")):
             mtp_lambda = get_mtp_loss_weight(
                 tokens_processed, config.total_tokens,
@@ -1718,6 +1739,8 @@ while True:
                 mtp_lambda=mtp_lambda,
             )
             loss = outputs['loss']
+        if args.profile:
+            _model_module._nvtx_pop()
         if _use_cuda_events:
             _evt_fwd_end.record()
 
@@ -1729,7 +1752,11 @@ while True:
         # Scale loss for gradient accumulation
         # Each .backward() ADDS to .grad -> divide by accum count
         loss = loss / current_accum
+        if args.profile:
+            _model_module._nvtx_push(f"backward/micro{micro_step}")
         loss.backward()
+        if args.profile:
+            _model_module._nvtx_pop()
         if _use_cuda_events:
             _evt_bwd_end.record()
 
@@ -1799,8 +1826,12 @@ while True:
         _evt_opt_start = torch.cuda.Event(enable_timing=True)
         _evt_opt_end = torch.cuda.Event(enable_timing=True)
         _evt_opt_start.record()
+    if args.profile:
+        _model_module._nvtx_push("optimizer")
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    if args.profile:
+        _model_module._nvtx_pop()
     if _use_cuda_events:
         _evt_opt_end.record()
 
