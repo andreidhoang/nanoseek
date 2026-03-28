@@ -1,5 +1,5 @@
 # Cross-Architecture Benchmarking: NanoChat (Dense) vs NanoSeek (MoE)
-## How a Senior AI Performance Engineer at a Frontier Lab Would Execute This
+## Quick 5-Day Comparison — Not a Research Project
 
 **Date**: 2026-03-28
 **Codebases**: NanoChat (dense GPT, ~124M-1.5B) | NanoSeek (MoE DeepSeek V3.2, 410M active / 1.95B total)
@@ -1028,48 +1028,40 @@ At 1B+ scale (expected, based on literature):
 
 ---
 
-## Execution Checklist
+## Execution Checklist — 5 Days, Not 35
+
+A performance engineer's job is to make the chosen architecture fast, not to publish an architecture comparison paper. This is a quick sanity check, not a research project.
 
 ```
-Phase 1 (Days 1-4):
-  □ Profile NanoChat at d16 (~410M) on RTX 4090
-  □ Profile NanoSeek ablation on RTX 4090
-  □ Generate side-by-side baseline table
-  □ Verify both fit in 24GB (may need batch_size=1)
+Day 1 (2 hours):
+  □ Profile NanoChat at ~410M params: torch.profiler → Perfetto trace
+  □ Profile NanoSeek ablation: same
+  □ Fill in side-by-side baseline table (step_time, MFU, peak_memory)
+  □ Answer: "Which component dominates in each architecture?"
 
-Phase 2 (Days 5-10):
-  □ Match configs (equal active params)
+Day 2 (half day):
+  □ Run 500-step training for both on ClimbMix, same seed
   □ Implement BPB evaluation on shared eval set
-  □ Run 500-step training for both
-  □ Generate 3 comparison plots (FLOPs, time, cost)
+  □ Generate the 3 comparison plots (FLOPs, time, cost)
+  □ Answer: "At equal wall-clock, which has better BPB?"
 
-Phase 3 (Days 11-18):
-  □ MLA vs GQA attention benchmark
-  □ Dense FFN vs MoE FFN benchmark
-  □ ReLU² vs SwiGLU benchmark
-  □ Optimizer step comparison
+Day 3 (half day):
+  □ MoE overhead decomposition (route + dispatch + combine vs dense equivalent)
+  □ Padding waste measurement (waste_ratio across layers)
+  □ Answer: "What % of MoE step time is overhead vs useful compute?"
 
-Phase 4 (Days 19-24):
-  □ MoE overhead decomposition
-  □ Padding waste analysis
-  □ Expert utilization heatmap
-  □ Dense-equivalent comparison
+Day 4 (2 hours):
+  □ KV cache comparison: MLA (207 values/token) vs GQA (2560 values/token)
+  □ Quick inference decode benchmark (tokens/sec at seq_len=2048)
+  □ Answer: "Where does MLA's 12x compression actually pay off?"
 
-Phase 5 (Days 25-28):
-  □ FP8 eligibility comparison
-  □ FP8 quantization error comparison
-
-Phase 6 (Days 29-32):
-  □ Inference prefill benchmark
-  □ Inference decode benchmark
-  □ KV cache memory comparison
-  □ Maximum context length comparison
-
-Phase 7 (Days 33-35):
-  □ Consolidated report with all tables and charts
-  □ Recommendations for architecture selection
-  □ Identification of optimization opportunities
+Day 5 (2 hours):
+  □ Write consolidated comparison table (1 page, not 35)
+  □ Answer: "What does this tell us about NanoFuse optimization targets?"
+  □ Move on to actually building kernels
 ```
+
+**Total: 5 days part-time (~20 hours). The comparison informs the kernel work, not replaces it.**
 
 ---
 

@@ -164,790 +164,116 @@ Activation scaling:
 
 ---
 
-## Execution Plan: 8 Weeks
+## How a Senior Engineer Actually Executes This
 
-### Week 0: Profiling & Measurement (Days 1-3)
-
-**Objective**: Establish ground truth baseline. Measure, don't guess.
-
-**Tasks**:
-
-1. **Profile NanoSeek ablation training** (existing sequential MoE dispatch)
-   ```bash
-   # Run 50 training steps with PyTorch profiler
-   python -m nanoseek.scripts.pre_train \
-       --run profile-baseline --scale ablation --seed 42 \
-       --num-iterations 50 --eval-every 50 --save-every -1 \
-       --device-batch-size 4
-   ```
-
-2. **Generate roofline analysis** for each component:
-   ```python
-   # Key measurements to capture:
-   # 1. Per-expert GEMM time (gate_proj, up_proj, down_proj)
-   # 2. Token dispatch overhead (scatter/gather)
-   # 3. Routing computation time
-   # 4. Memory bandwidth utilization per operation
-   # 5. SM occupancy during expert computation
-
-   # Tool: torch.profiler with trace export
-   with torch.profiler.profile(
-       activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-       schedule=torch.profiler.schedule(wait=5, warmup=5, active=10),
-       on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_baseline'),
-       record_shapes=True,
-       profile_memory=True,
-       with_stack=True,
-       with_flops=True,
-   ) as prof:
-       for step in range(20):
-           train_step()
-           prof.step()
-   ```
-
-3. **Compute theoretical peak** and current MFU:
-   ```
-   H100 SXM theoretical: 989 TFLOPS (BF16), 1,979 TFLOPS (FP8)
-   A6000 theoretical: 155 TFLOPS (BF16)
-
-   MFU = measured_TFLOPS / theoretical_TFLOPS
-   Target: identify how far below theoretical we are
-   ```
-
-4. **Document baseline** in structured format:
-   ```
-   Baseline Report:
-   - Step time: ___ms
-   - Expert dispatch time: ___ms (___% of step)
-   - Per-expert GEMM time: ___ms
-   - Token routing time: ___ms
-   - Memory peak: ___GB
-   - MFU: ___%
-   - Bottleneck classification: compute-bound | memory-bound | launch-bound
-   ```
-
-**Deliverable**: `nanoseek/benchmarks/baseline_profile.md` with Chrome trace, roofline chart, and bottleneck classification.
-
-**Decision Gate**: If expert dispatch is <30% of step time, pivot to attention optimization instead. Proceed only if dispatch is the dominant bottleneck.
+**Total timeline**: 4 weeks (not 8). Less planning, more iterating.
+**Core loop**: Profile → Hypothesis → Kernel → Nsight → Fix → Verify → Next.
+**Time split**: 20% quick Python timing, 50% Nsight Compute, 30% writing/testing kernels.
 
 ---
 
-### Week 1: Grouped GEMM Foundation (Days 4-7)
+## Execution Plan: 4 Weeks
 
-**Objective**: Replace sequential expert loop with a single grouped GEMM call.
+### Week 1: Profile → Grouped GEMM (Days 1-5)
 
-**Tasks**:
+**Day 1 morning**: Profile baseline. 30 minutes, not 3 days.
 
-1. **Implement Align & Sort dispatch** (Triton kernel):
-   ```python
-   # nanoseek/nanoseek/kernels/moe_dispatch.py
+```bash
+# Profile 50 steps, open trace in Perfetto, find the bottleneck
+python -m nanoseek.scripts.pre_train \
+    --run profile-baseline --scale ablation --seed 42 \
+    --num-iterations 50 --eval-every 50 --save-every -1 --device-batch-size 2
+```
 
-   @triton.jit
-   def align_and_sort_kernel(
-       # Input: expert_assignments [B*T], routing_weights [B*T, top_k]
-       # Output: sorted_token_ids, expert_offsets, expert_sizes
-       expert_assignments_ptr,
-       sorted_ids_ptr,
-       expert_offsets_ptr,
-       num_tokens: tl.constexpr,
-       num_experts: tl.constexpr,
-   ):
-       """
-       Sort tokens by expert assignment for grouped GEMM.
+**Day 1 afternoon**: If MoE > 30% of step → write grouped GEMM. If not → pivot.
 
-       Algorithm:
-       1. Histogram: count tokens per expert (atomic add)
-       2. Prefix sum: compute expert_offsets = cumsum(expert_counts)
-       3. Scatter: place each token_id at its expert's offset position
+**Days 2-3**: Implement align & sort dispatch + `torch._grouped_mm` wrapper.
+- Start with Option A (`torch._grouped_mm`) — zero dependencies, 30 lines
+- Unit test: fused output must match sequential within BF16 tolerance
+- `triton.testing.do_bench` comparison: grouped vs batched BMM
 
-       This converts irregular routing into contiguous expert batches,
-       enabling grouped GEMM instead of 64 sequential launches.
-       """
-       # Implementation follows SGLang's Align & Sort pattern
-       pass
-   ```
+**Days 4-5**: Nsight Compute on the grouped GEMM kernel.
+- `ncu --set full -o grouped_gemm python benchmark_kernel.py`
+- Check: compute throughput %, memory throughput %, warp stalls
+- Sweep tile sizes: BLOCK_M=[64,128,256], BLOCK_K=[32,64,128]
+- Fix bottleneck (bank conflicts? register spill? wrong tile size?)
+- Re-profile, iterate until ≥1.5x speedup over batched BMM
 
-2. **Implement grouped GEMM wrapper**:
-   ```python
-   # Option A: torch._grouped_mm (PyTorch native, simplest)
-   # Option B: Triton grouped GEMM (more control, portable)
-   # Option C: CUTLASS grouped GEMM (maximum performance)
-
-   # Start with Option A, profile, upgrade if needed
-
-   def fused_moe_forward(
-       hidden_states: torch.Tensor,      # [num_tokens, d_model]
-       expert_assignments: torch.Tensor,  # [num_tokens, top_k]
-       routing_weights: torch.Tensor,     # [num_tokens, top_k]
-       gate_weights: list[torch.Tensor],  # [num_experts] x [inter_dim, d_model]
-       up_weights: list[torch.Tensor],    # [num_experts] x [inter_dim, d_model]
-       down_weights: list[torch.Tensor],  # [num_experts] x [d_model, inter_dim]
-   ) -> torch.Tensor:
-       """
-       Fused MoE: dispatch + grouped SwiGLU FFN + combine.
-
-       Instead of 64 sequential expert calls:
-       1. Sort tokens by expert (align_and_sort)
-       2. Stack all expert weights → single grouped GEMM
-       3. Apply SwiGLU activation (fused)
-       4. Second grouped GEMM (down projection)
-       5. Scatter-add with routing weights
-       """
-       # Sort tokens
-       sorted_ids, expert_offsets = align_and_sort(expert_assignments)
-       sorted_x = hidden_states[sorted_ids]
-
-       # Stack weights for grouped GEMM
-       # Gate: [num_experts, inter_dim, d_model]
-       # Up:   [num_experts, inter_dim, d_model]
-       # Down: [num_experts, d_model, inter_dim]
-       W_gate = torch.stack(gate_weights)
-       W_up = torch.stack(up_weights)
-       W_down = torch.stack(down_weights)
-
-       # Expert sizes for grouped GEMM
-       expert_sizes = expert_offsets[1:] - expert_offsets[:-1]
-
-       # Grouped GEMM: gate projection
-       gate_out = torch._grouped_mm(sorted_x, W_gate.transpose(-1,-2),
-                                      offs=expert_offsets)
-
-       # Grouped GEMM: up projection
-       up_out = torch._grouped_mm(sorted_x, W_up.transpose(-1,-2),
-                                    offs=expert_offsets)
-
-       # Fused SwiGLU
-       h = F.silu(gate_out) * up_out
-
-       # Grouped GEMM: down projection
-       expert_out = torch._grouped_mm(h, W_down.transpose(-1,-2),
-                                        offs=expert_offsets)
-
-       # Combine: weighted scatter-add
-       output = torch.zeros_like(hidden_states)
-       for k in range(top_k):
-           token_ids = expert_assignments[:, k]
-           weights_k = routing_weights[:, k].unsqueeze(-1)
-           output.scatter_add_(0, sorted_ids.unsqueeze(-1).expand_as(expert_out),
-                               expert_out * weights_k)
-
-       return output
-   ```
-
-3. **Unit test**: Verify fused output matches sequential output within BF16 tolerance.
-   ```python
-   def test_fused_matches_sequential():
-       """Fused MoE must match sequential within 1e-5 relative error."""
-       # Run same input through both paths
-       seq_output = sequential_moe(x, assignments, weights, experts)
-       fused_output = fused_moe_forward(x, assignments, weights, ...)
-       torch.testing.assert_close(seq_output, fused_output, rtol=1e-5, atol=1e-5)
-   ```
-
-4. **Profile grouped vs sequential**:
-   ```
-   Expected results (based on literature):
-   - Sequential 64 experts: ~45ms per MoE layer (A6000)
-   - Grouped GEMM: ~15-25ms per MoE layer
-   - Speedup: 1.8-3x on MoE dispatch alone
-   ```
-
-**Deliverable**: `nanoseek/nanoseek/kernels/moe_dispatch.py` + `nanoseek/nanoseek/kernels/grouped_gemm.py` with passing tests and benchmark comparison.
-
-**Decision Gate**: Grouped GEMM must be ≥1.5x faster than sequential. If not, investigate whether the bottleneck is memory-bandwidth (need fusion) rather than launch overhead.
+**Decision Gate**: ≥1.5x grouped over batched. If not, investigate memory-bandwidth bottleneck.
 
 ---
 
-### Week 2: SwiGLU Fusion & Activation Optimization (Days 8-11)
+### Week 2: Fused SwiGLU + Blockwise FP8 (Days 6-10)
 
-**Objective**: Fuse SwiGLU activation into the GEMM pipeline to eliminate intermediate tensor materialization.
+**Days 6-7**: Fuse SwiGLU into pipeline.
+- Write Triton fused_swiglu kernel (forward: 20 lines, backward with recomputation: 30 lines)
+- Integrate into grouped GEMM pipeline: gate GEMM → fused SwiGLU → down GEMM
+- Memory benchmark: expect 60-75% activation memory reduction
+- Nsight Compute: verify SwiGLU kernel is bandwidth-bound (should be ~800+ GB/s on 4090)
 
-**Tasks**:
+**Days 8-10**: Blockwise FP8 quantization — the crown jewel.
+- Implement blockwise quantize kernel (128×128 blocks, ~40 lines Triton)
+- Implement blockwise GEMM with fused in-loop rescaling (~80 lines Triton)
+- Key: rescale INSIDE the K-loop accumulator, not post-hoc
+- Precision test: blockwise must have ≥2x lower relative error than tensorwise
+- Note: actual FP8 GEMM benchmarks need H100 (Week 3). On RTX 4090, validate correctness only.
 
-1. **Fused SwiGLU Triton kernel**:
-   ```python
-   @triton.jit
-   def fused_swiglu_kernel(
-       gate_ptr, up_ptr, output_ptr,
-       n_elements: tl.constexpr,
-       BLOCK_SIZE: tl.constexpr,
-   ):
-       """
-       Fused SiLU(gate) * up — eliminates materializing gate and up separately.
-
-       Memory savings: 2 * [tokens, inter_dim] intermediate tensors eliminated.
-       For NanoSeek ablation (inter_dim=3440): saves ~26MB per MoE layer.
-       For NanoSeek 1B (inter_dim=5504): saves ~42MB per MoE layer.
-
-       This is exactly what Liger-Kernel does, but fused into our MoE pipeline.
-       """
-       pid = tl.program_id(0)
-       offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-       mask = offsets < n_elements
-
-       gate = tl.load(gate_ptr + offsets, mask=mask)
-       up = tl.load(up_ptr + offsets, mask=mask)
-
-       # SiLU(gate) * up — fused, no intermediate materialization
-       silu_gate = gate * tl.sigmoid(gate)
-       result = silu_gate * up
-
-       tl.store(output_ptr + offsets, result, mask=mask)
-   ```
-
-2. **Backward pass with recomputation** (Liger-Kernel strategy):
-   ```python
-   @triton.jit
-   def fused_swiglu_backward_kernel(
-       grad_output_ptr, gate_ptr, up_ptr,
-       grad_gate_ptr, grad_up_ptr,
-       n_elements: tl.constexpr,
-       BLOCK_SIZE: tl.constexpr,
-   ):
-       """
-       Backward: recompute SiLU(gate) instead of saving it.
-
-       Trade: ~0.5% extra compute for 1.6x memory reduction.
-       This is the proven Liger-Kernel approach.
-
-       grad_gate = grad_output * up * (sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate)))
-       grad_up = grad_output * SiLU(gate)
-       """
-       pass
-   ```
-
-3. **Integration into grouped GEMM pipeline**:
-   - Gate GEMM → fused SwiGLU → Down GEMM (3 stages, 2 GEMMs + 1 fused activation)
-   - Eliminate intermediate `gate_out` and `up_out` tensor allocations
-
-4. **Memory benchmark**:
-   ```
-   Before (sequential + materialized):
-   - gate_out: [tokens_per_expert, inter_dim] x 64 experts
-   - up_out:   [tokens_per_expert, inter_dim] x 64 experts
-   - Total intermediate: ~1.6GB (ablation), ~4.2GB (1B)
-
-   After (fused, recompute in backward):
-   - Only output tensor materialized
-   - Total intermediate: ~0.4GB (ablation), ~1.0GB (1B)
-   - Savings: 60-75%
-   ```
-
-**Deliverable**: `nanoseek/nanoseek/kernels/fused_swiglu.py` with forward + backward kernels, integrated into MoE pipeline.
+**Decision Gate**: Blockwise quant error < tensorwise error. Fused SwiGLU saves ≥40% memory.
 
 ---
 
-### Week 3: Blockwise FP8 Scaling (Days 12-18)
+### Week 3: Training Integration + Validation (Days 11-15)
 
-**Objective**: Implement DeepSeek V3's blockwise FP8 scaling strategy in Triton — the frontier approach that has no high-quality open-source implementation.
+**Days 11-12**: Wire everything into NanoSeek.
+- Custom `autograd.Function` for backward pass (E4M3 forward, E5M2 backward, FP32 accum)
+- Add `--fused-moe` flag to pre_train.py
+- `torch.autograd.gradcheck` for gradient correctness
+- Fused combine kernel (scatter-add + shared expert in one launch)
 
-**This is the crown jewel of the project.**
+**Days 13-14**: Training validation — the test that matters.
+```bash
+# Baseline: 500 steps, seed 42
+python -m nanoseek.scripts.pre_train --run baseline --scale ablation --seed 42 \
+    --num-iterations 500 --eval-every 100 --save-every -1 --device-batch-size 2
 
-**Tasks**:
+# NanoFuse: same everything except --fused-moe
+python -m nanoseek.scripts.pre_train --run nanofuse --scale ablation --seed 42 \
+    --num-iterations 500 --eval-every 100 --save-every -1 --device-batch-size 2 --fused-moe
+```
+- Compare: `ema_val/bpb` within 0.5%, `train/h_load` identical, `train/grad_norm` matches
+- If any metric diverges > 1%: kernel has a bug. Fix before proceeding.
 
-1. **Understand the math** (first principles):
-   ```
-   Tensorwise scaling (current fp8.py):
-     scale = max(|W|) / E4M3_MAX
-     W_fp8 = quantize(W / scale)
-     Output = (A_fp8 @ W_fp8) * (scale_A * scale_W)
+**Day 15**: Before/after profiling.
+- Re-run torch.profiler with NanoFuse enabled
+- Generate comparison table: step_time, MFU, memory, tokens/sec
+- Nsight Compute on final kernel versions
+- Quick NanoChat comparison: 500 steps at matched active params, compare BPB vs wall-clock
 
-   Problem: Single scale for entire tensor.
-   If max element is 1000 but 99% of elements are <1,
-   those small elements lose ALL precision in FP8.
-
-   Blockwise scaling (DeepSeek V3):
-     For each 128×128 block of W:
-       scale_ij = max(|W[i:i+128, j:j+128]|) / E4M3_MAX
-       W_fp8[i:i+128, j:j+128] = quantize(W[i:i+128, j:j+128] / scale_ij)
-
-     For each 1×128 vector of activations A:
-       scale_k = max(|A[k, 0:128]|) / E4M3_MAX
-       A_fp8[k, 0:128] = quantize(A[k, 0:128] / scale_k)
-
-     Output[i,j] = sum over blocks(A_fp8_block @ W_fp8_block * scale_A_k * scale_W_ij)
-
-   Key: Rescaling MUST happen inside the GEMM mainloop,
-   not as a post-hoc multiply. This is what makes it hard.
-   ```
-
-2. **Implement blockwise quantization** (Triton):
-   ```python
-   @triton.jit
-   def blockwise_fp8_quantize_kernel(
-       input_ptr, output_ptr, scales_ptr,
-       M, N,
-       BLOCK_M: tl.constexpr = 128,
-       BLOCK_N: tl.constexpr = 128,
-   ):
-       """
-       Quantize a matrix to FP8 E4M3 with per-block scaling.
-
-       Each 128×128 block gets its own scale factor.
-       Scale = max(|block|) / 448.0 (E4M3 max representable value)
-
-       The scale grid has shape [M//128, N//128].
-       """
-       block_m = tl.program_id(0)
-       block_n = tl.program_id(1)
-
-       # Load 128×128 block
-       offsets_m = block_m * BLOCK_M + tl.arange(0, BLOCK_M)
-       offsets_n = block_n * BLOCK_N + tl.arange(0, BLOCK_N)
-       mask = (offsets_m[:, None] < M) & (offsets_n[None, :] < N)
-
-       block = tl.load(input_ptr + offsets_m[:, None] * N + offsets_n[None, :], mask=mask)
-
-       # Compute block-level scale
-       abs_max = tl.max(tl.abs(block))
-       scale = abs_max / 448.0  # E4M3 max
-       scale = tl.where(scale > 0, scale, 1.0)  # Avoid division by zero
-
-       # Quantize
-       quantized = (block / scale).to(tl.float8e4m3fn)
-
-       # Store quantized values and scale
-       tl.store(output_ptr + offsets_m[:, None] * N + offsets_n[None, :],
-                quantized, mask=mask)
-       tl.store(scales_ptr + block_m * (N // BLOCK_N) + block_n, scale)
-   ```
-
-3. **Implement blockwise GEMM with fused rescaling** (the hard part):
-   ```python
-   @triton.jit
-   def blockwise_fp8_grouped_gemm_kernel(
-       # A: [M, K] in FP8 with row scales [M, K//128]
-       # B: [K, N] in FP8 with block scales [K//128, N//128]
-       # C: [M, N] output in BF16
-       A_ptr, B_ptr, C_ptr,
-       A_scales_ptr, B_scales_ptr,
-       M, N, K,
-       BLOCK_M: tl.constexpr = 128,
-       BLOCK_N: tl.constexpr = 128,
-       BLOCK_K: tl.constexpr = 128,
-   ):
-       """
-       Grouped GEMM with blockwise FP8 scaling.
-
-       The critical insight from DeepSeek V3:
-       - Accumulate in FP32 (not FP16) to prevent precision loss
-       - Rescale per block INSIDE the K-loop, not after
-       - Each (BLOCK_M, BLOCK_N) output tile accumulates
-         contributions from K//BLOCK_K inner blocks,
-         each with its own pair of scales
-
-       C[m, n] = sum_k ( A_fp8[m, k] * scale_A[m, k//128]
-                       * B_fp8[k, n] * scale_B[k//128, n//128] )
-       """
-       pid_m = tl.program_id(0)
-       pid_n = tl.program_id(1)
-
-       # Accumulator in FP32
-       acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-       for k_block in range(0, K // BLOCK_K):
-           # Load A block [BLOCK_M, BLOCK_K] in FP8
-           a = tl.load(...)  # A[pid_m*BM : (pid_m+1)*BM, k_block*BK : (k_block+1)*BK]
-
-           # Load B block [BLOCK_K, BLOCK_N] in FP8
-           b = tl.load(...)  # B[k_block*BK : (k_block+1)*BK, pid_n*BN : (pid_n+1)*BN]
-
-           # Load scales for this block pair
-           scale_a = tl.load(A_scales_ptr + ...)  # [BLOCK_M] row scales
-           scale_b = tl.load(B_scales_ptr + ...)  # Scalar block scale
-
-           # FP8 matmul with fused rescaling
-           # WGMMA on Hopper: native FP8 tensor core operation
-           block_result = tl.dot(a, b)  # FP8 dot product → FP32 accumulator
-
-           # Rescale in-loop (not post-hoc!)
-           acc += block_result * (scale_a[:, None] * scale_b)
-
-       # Store final result in BF16
-       c = acc.to(tl.bfloat16)
-       tl.store(C_ptr + ..., c)
-   ```
-
-4. **Integrate with grouped MoE**:
-   - All 64 expert weight matrices pre-quantized to FP8 with block scales
-   - Activations quantized on-the-fly with row scales (1x128)
-   - Gate router remains BF16 (routing precision is sacred — NanoSeek rule)
-   - MLA projections remain BF16 (lora ranks 275/90/440/143 not 128-aligned)
-   - Shared experts remain BF16 (only 2, overhead negligible)
-
-5. **Precision validation**:
-   ```python
-   def test_blockwise_fp8_precision():
-       """Blockwise FP8 must have lower quantization error than tensorwise."""
-       W = torch.randn(2048, 5504, dtype=torch.bfloat16).cuda()
-
-       # Tensorwise (current)
-       tw_scale = W.abs().max() / 448.0
-       tw_quantized = (W / tw_scale).to(torch.float8_e4m3fn)
-       tw_error = (tw_quantized.float() * tw_scale - W.float()).norm() / W.float().norm()
-
-       # Blockwise (new)
-       bw_quantized, bw_scales = blockwise_quantize(W, block_size=128)
-       bw_reconstructed = blockwise_dequantize(bw_quantized, bw_scales)
-       bw_error = (bw_reconstructed - W.float()).norm() / W.float().norm()
-
-       # Blockwise MUST have lower error
-       assert bw_error < tw_error, f"Blockwise {bw_error:.6f} >= Tensorwise {tw_error:.6f}"
-       # Expected: blockwise ~2-5x lower relative error
-   ```
-
-**Deliverable**: `nanoseek/nanoseek/kernels/blockwise_fp8.py` + `nanoseek/nanoseek/kernels/fp8_grouped_gemm.py` with complete forward pass, precision tests, and benchmark comparison against tensorwise.
+**Decision Gate**: Loss curves match. Step speedup ≥1.3x. Memory reduction ≥30%.
 
 ---
 
-### Week 4: Backward Pass & Training Integration (Days 19-25)
-
-**Objective**: Complete the backward pass for blockwise FP8 grouped GEMM and integrate into NanoSeek's training loop.
-
-**Tasks**:
-
-1. **Backward pass implementation**:
-   ```
-   Forward:  Y = X_fp8 @ W_fp8  (with blockwise scales)
-
-   Backward (3 GEMMs):
-   dX = dY @ W^T           ← Uses E5M2 for dY (wider range for gradients)
-   dW = X^T @ dY            ← Gradient accumulation in FP32
-   (no activation grad for W since W is a parameter)
-
-   Key decisions:
-   - Forward: E4M3 (higher precision, 4 exponent bits, 3 mantissa)
-   - Backward: E5M2 (wider range, 5 exponent bits, 2 mantissa)
-   - Accumulation: Always FP32 (never FP16, this kills training)
-   - use_fast_accum: True for forward, False for backward
-     (matches NanoSeek's existing fp8.py convention)
-   ```
-
-2. **Custom autograd.Function**:
-   ```python
-   class BlockwiseFP8GroupedMoE(torch.autograd.Function):
-       @staticmethod
-       def forward(ctx, hidden_states, expert_weights, routing_info):
-           # Quantize activations to FP8 E4M3 with row scales
-           x_fp8, x_scales = blockwise_quantize_activations(hidden_states)
-
-           # Expert weights already quantized (done once at init/periodically)
-           # Run fused dispatch + grouped GEMM + combine
-           output = fused_moe_fp8_forward(x_fp8, x_scales,
-                                           expert_weights, routing_info)
-
-           ctx.save_for_backward(hidden_states, expert_weights, routing_info)
-           return output
-
-       @staticmethod
-       def backward(ctx, grad_output):
-           hidden_states, expert_weights, routing_info = ctx.saved_tensors
-
-           # Quantize grad_output to FP8 E5M2 (wider range for gradients)
-           grad_fp8, grad_scales = blockwise_quantize_e5m2(grad_output)
-
-           # dX = grad @ W^T (grouped GEMM, FP8)
-           grad_input = fused_moe_fp8_backward_input(grad_fp8, grad_scales,
-                                                      expert_weights, routing_info)
-
-           # dW = X^T @ grad (grouped GEMM, FP8, accumulate in FP32)
-           grad_weights = fused_moe_fp8_backward_weight(hidden_states,
-                                                         grad_fp8, grad_scales,
-                                                         routing_info)
-
-           return grad_input, grad_weights, None
-   ```
-
-3. **Integration into NanoSeek's pre_train.py**:
-   ```python
-   # In pre_train.py, add --fused-moe flag
-   parser.add_argument('--fused-moe', action='store_true',
-                       help='Use fused MoE kernels with blockwise FP8')
-
-   # In model initialization
-   if args.fused_moe:
-       from nanoseek.kernels import NanoFuseMoE
-       # Replace sequential MoEDispatch with NanoFuseMoE
-       for layer in model.layers:
-           layer.moe = NanoFuseMoE.from_sequential(layer.moe)
-   ```
-
-4. **Training validation** (critical):
-   ```bash
-   # Run 500 steps with both paths, compare loss curves
-   # BF16 sequential baseline
-   python -m nanoseek.scripts.pre_train \
-       --run validation-baseline --scale ablation --seed 42 \
-       --num-iterations 500 --eval-every 100 --save-every -1
-
-   # Fused MoE with blockwise FP8
-   python -m nanoseek.scripts.pre_train \
-       --run validation-fused-fp8 --scale ablation --seed 42 \
-       --num-iterations 500 --eval-every 100 --save-every -1 \
-       --fused-moe --fp8
-
-   # Compare: ema_val/bpb must be within 0.5% at step 500
-   ```
-
-5. **Gradient correctness test**:
-   ```python
-   def test_gradient_correctness():
-       """torch.autograd.gradcheck on fused MoE layer."""
-       # Use float64 for numerical gradient checking
-       model_fp64 = make_small_moe(dtype=torch.float64)
-       x = torch.randn(32, 256, dtype=torch.float64, requires_grad=True)
-       torch.autograd.gradcheck(model_fp64, x, eps=1e-6, atol=1e-4, rtol=1e-3)
-   ```
-
-**Deliverable**: Complete forward + backward pass integrated into NanoSeek training, with loss curve comparison showing <0.5% BPB deviation.
-
----
-
-### Week 5: Combine Kernel & Shared Expert Fusion (Days 26-30)
-
-**Objective**: Optimize the output combine stage and integrate shared expert path.
-
-**Tasks**:
-
-1. **Fused scatter-add combine kernel**:
-   ```python
-   @triton.jit
-   def fused_combine_kernel(
-       expert_output_ptr,    # [total_selected_tokens, d_model]
-       routing_weights_ptr,  # [num_tokens, top_k]
-       token_map_ptr,        # Maps sorted position → original position
-       output_ptr,           # [num_tokens, d_model]
-       shared_expert_ptr,    # [num_tokens, d_model] (shared expert output)
-       num_tokens, d_model, top_k,
-       BLOCK_D: tl.constexpr = 128,
-   ):
-       """
-       Fused: routing_weight * expert_output → scatter_add + shared_expert_add
-
-       Eliminates 3 separate kernel launches:
-       1. Multiply by routing weights
-       2. Scatter-add to original positions
-       3. Add shared expert output
-
-       All in one kernel = one global memory read/write cycle.
-       """
-       pass
-   ```
-
-2. **Shared expert optimization**:
-   ```
-   NanoSeek has 2 shared experts (always active for all tokens).
-   These are dense FFNs, not routed.
-
-   Optimization: overlap shared expert compute with routed expert dispatch.
-   - Launch shared expert on a separate CUDA stream
-   - While grouped GEMM runs 64 routed experts on stream 0,
-     2 shared experts run on stream 1
-   - Combine outputs after both complete
-
-   Expected gain: ~5-8% (shared experts are small relative to routed)
-   ```
-
-3. **End-to-end fusion benchmark**:
-   ```
-   Before (sequential):
-     Route → 64x Expert → Combine → Shared → Add
-     Total: ~45ms per MoE layer (A6000)
-
-   After (NanoFuse):
-     Route → Align&Sort → GroupedGEMM_FP8 → FusedCombine+Shared
-     Total: ~12-18ms per MoE layer (expected)
-     Speedup: 2.5-3.8x on MoE layer
-     Overall step speedup: 1.3-1.8x (MoE is 45-55% of step)
-   ```
-
-**Deliverable**: Complete NanoFuse pipeline with all stages fused, benchmark report.
-
----
-
-### Week 6: Multi-GPU & FSDP2 Integration (Days 31-35)
-
-**Objective**: Ensure fused kernels work correctly with distributed training.
-
-**Tasks**:
-
-1. **FSDP2 compatibility testing**:
-   ```python
-   # NanoSeek targets 8xH100 for 1B graduation run
-   # FSDP2 shards parameters across GPUs
-   # Our fused MoE must handle:
-   # - Sharded expert weights (W_gate, W_up, W_down per expert)
-   # - All-gather before grouped GEMM
-   # - Reduce-scatter after combine
-
-   # Test: 2-GPU DDP smoke test
-   torchrun --nproc_per_node=2 -m nanoseek.scripts.pre_train \
-       --run fsdp-test --scale ablation --seed 42 \
-       --num-iterations 20 --fused-moe --fp8
-   ```
-
-2. **Communication overlap**:
-   ```
-   For 8xH100 (NanoSeek 1B):
-   - FSDP2 all-gather for next layer overlaps with current layer compute
-   - Expert weights are the largest parameters (64 experts × 3 projections)
-   - Pre-quantize weights to FP8 before all-gather → 2x communication reduction
-
-   Implementation:
-   - Register forward hooks on MoE layers
-   - In pre-forward hook: initiate all-gather for next layer's expert weights
-   - Quantize to FP8 on the source rank before sending (save bandwidth)
-   ```
-
-3. **Gradient synchronization**:
-   ```python
-   # Expert gradients after backward:
-   # - Each rank has full gradients for its shard
-   # - Reduce-scatter distributes gradient shards
-   # - FP8 gradient compression for reduce-scatter (E5M2)
-   #   → 2x reduction in backward communication
-
-   # This is exactly what ZeRO++ qgZ does
-   ```
-
-**Deliverable**: Verified 2-GPU and 8-GPU training with fused MoE kernels, communication overlap benchmarks.
-
----
-
-### Week 7: Comprehensive Benchmarking & Profiling (Days 36-40)
-
-**Objective**: Generate publication-quality benchmarks and profiling evidence.
-
-**Tasks**:
-
-1. **Benchmark matrix**:
-
-   | Configuration | Hardware | Scale | Steps | Metrics |
-   |---------------|----------|-------|-------|---------|
-   | Sequential BF16 | A6000 | ablation | 500 | step_time, MFU, memory, bpb |
-   | Grouped BF16 | A6000 | ablation | 500 | step_time, MFU, memory, bpb |
-   | Grouped FP8 tensorwise | A6000* | ablation | 500 | step_time, MFU, memory, bpb |
-   | NanoFuse FP8 blockwise | H100 | ablation | 500 | step_time, MFU, memory, bpb |
-   | NanoFuse FP8 blockwise | H100 | 1B | 200 | step_time, MFU, memory, bpb |
-   | Sequential BF16 | H100 | 1B | 200 | step_time, MFU, memory, bpb |
-
-   *Note: FP8 on A6000 is simulated (no FP8 tensor cores), measures only compute
-
-2. **Roofline analysis** for each kernel:
-   ```
-   For each kernel (align_sort, grouped_gemm_fp8, fused_swiglu, combine):
-   - Arithmetic intensity (FLOPS / bytes transferred)
-   - Achieved bandwidth (bytes/s vs HBM peak)
-   - Achieved compute (TFLOPS vs SM peak)
-   - Classification: compute-bound, memory-bound, or latency-bound
-   ```
-
-3. **Scaling analysis**:
-   ```
-   How does NanoFuse scale with:
-   - Number of experts (8, 16, 32, 64, 128)
-   - Expert batch size (tokens_per_expert: 16, 64, 256, 1024)
-   - Model dimension (1280, 2048, 4096)
-   - Top-k (2, 4, 8, 16)
-
-   This answers: "When should you use NanoFuse vs sequential?"
-   Answer: NanoFuse wins when experts > 16 AND tokens_per_expert > 32
-   ```
-
-4. **Loss curve comparison** (final validation):
-   ```
-   Plot side-by-side:
-   - ema_val/bpb over 1000 steps (ablation scale)
-   - train/h_load (expert balance)
-   - eval/i_spec_mean (expert specialization)
-   - train/grad_norm
-
-   All must match within noise floor.
-   ```
-
-**Deliverable**: `nanoseek/benchmarks/nanofuse_report.md` with tables, charts, roofline plots, and scaling analysis.
-
----
-
-### Week 8: Documentation, Blog Post & Release (Days 41-45)
-
-**Objective**: Package for open-source release and career impact.
-
-**Tasks**:
-
-1. **Technical blog post** (2000-3000 words):
-   ```markdown
-   # NanoFuse: Fused MoE Kernels with Blockwise FP8 Scaling
-
-   ## The Problem
-   - MoE dispatch is 45-55% of training step time
-   - Sequential expert loops waste GPU parallelism
-   - Tensorwise FP8 loses precision on outlier-containing weights
-
-   ## The Solution
-   - Align & Sort token dispatch (one kernel launch for all 64 experts)
-   - Grouped GEMM with fused SwiGLU (3 stages → 1 fused pipeline)
-   - Blockwise FP8 scaling (128×128 blocks, DeepSeek V3's approach)
-
-   ## Results
-   - 2.5-3.8x speedup on MoE dispatch
-   - 1.3-1.8x overall training step speedup
-   - 40%+ memory reduction
-   - <0.5% BPB deviation from BF16 baseline
-   - Validated end-to-end in NanoSeek (64 experts, top-8, 4.75B params)
-
-   ## How It Works
-   [Detailed technical explanation with diagrams]
-
-   ## Benchmarks
-   [Tables and charts from Week 7]
-
-   ## Code
-   [Link to open-source repository]
-   ```
-
-2. **Clean API documentation**:
-   ```python
-   # nanoseek/nanoseek/kernels/__init__.py
-
-   from .nanofuse import NanoFuseMoE
-   from .blockwise_fp8 import blockwise_quantize, blockwise_dequantize
-   from .fused_swiglu import FusedSwiGLU
-
-   __all__ = ['NanoFuseMoE', 'blockwise_quantize', 'FusedSwiGLU']
-
-   # Usage:
-   # from nanoseek.kernels import NanoFuseMoE
-   # moe_layer = NanoFuseMoE(num_experts=64, d_model=2048, inter_dim=5504, top_k=8)
-   # output = moe_layer(hidden_states, routing_weights, expert_assignments)
-   ```
-
-3. **Test suite** (comprehensive):
-   ```
-   tests/test_kernels/
-   ├── test_align_and_sort.py       # Dispatch correctness
-   ├── test_grouped_gemm.py         # GEMM correctness vs torch.mm
-   ├── test_blockwise_fp8.py        # Quantization precision
-   ├── test_fused_swiglu.py         # Activation correctness
-   ├── test_nanofuse_e2e.py         # End-to-end output match
-   ├── test_nanofuse_backward.py    # Gradient correctness
-   ├── test_nanofuse_fsdp.py        # Distributed compatibility
-   └── benchmark_nanofuse.py        # Performance regression tests
-   ```
-
-4. **Optional: Workshop paper draft** (MLSys/ISCA/EuroSys):
-   ```
-   Title: "NanoFuse: Fused MoE Dispatch with Blockwise FP8 Scaling
-           for Efficient Mixture-of-Experts Training"
-
-   Key contributions:
-   1. First open-source Triton implementation of blockwise FP8 GEMM
-   2. Fused dispatch-compute-combine pipeline for MoE
-   3. End-to-end validation at 4.75B parameter scale
-   4. Comprehensive scaling analysis across expert count and batch size
-   ```
-
-**Deliverable**: Blog post, documentation, test suite, optional paper draft.
+### Week 4: Polish + Ship (Days 16-20)
+
+**Days 16-17**: Multi-GPU smoke test + edge cases.
+- 2-GPU DDP test (if available): `torchrun --nproc_per_node=2`
+- Edge cases: empty experts (0 tokens), extreme imbalance, batch_size=1
+- Performance regression test script (runs automatically, fails if ≥5% slower)
+
+**Days 18-19**: H100 validation (rent 1x H100, ~$30).
+- Validate FP8 tensor core path actually works
+- Benchmark: blockwise FP8 grouped GEMM vs BF16 grouped GEMM
+- Expected: 1.3-1.5x additional speedup from FP8 on H100
+
+**Day 20**: Ship.
+- Blog post with before/after numbers (not theory — measured)
+- Clean test suite (8 test files, all passing)
+- PR with benchmark results in the commit message
+
+```
+Total: 20 working days. Not 45.
+The difference: less planning, more Nsight Compute, faster iteration.
+```
 
 ---
 

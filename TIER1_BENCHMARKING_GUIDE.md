@@ -1,7 +1,12 @@
 # Tier 1 Benchmarking & Profiling Guide
-## RTX 4090 (24GB) — Weeks 0-4: Kernel Development & Validation
+## RTX 4090 (24GB) — Weeks 1-4: Kernel Development & Validation
 
-**Premise**: Every optimization must be measured, not guessed. A senior performance engineer at a frontier lab never writes a kernel without profiling the baseline first, never ships a kernel without A/B benchmarking, and never claims a speedup without roofline justification.
+**Premise**: Profile → Hypothesis → Kernel → Nsight → Fix → Verify → Next. Repeat.
+
+**Time split**: 20% quick Python timing | 50% Nsight Compute | 30% writing kernels.
+**Not**: 70% Python benchmark frameworks | 20% docs | 10% Nsight Compute.
+
+Every optimization must be measured. But measurement is a 30-line script, not a 200-line framework. Write benchmarks AFTER you have something to benchmark, not before.
 
 **Hardware baseline** (RTX 4090):
 ```
@@ -1600,37 +1605,58 @@ ncu --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum \
 
 ---
 
-## Appendix D: File Structure
+## Appendix D: The Iterative Nsight Compute Loop
+
+This is the actual workflow that occupies 50% of a senior engineer's time:
+
+```
+For each kernel you write (grouped_gemm, fused_swiglu, blockwise_fp8, combine):
+
+1. Write kernel (30 min - 2 hours)
+2. Correctness test: output matches PyTorch reference (5 min)
+3. Quick bench: triton.testing.do_bench, note ms and GB/s (2 min)
+4. Nsight Compute full profile:
+   ncu --set full -o kernel_v1 python bench_kernel.py
+5. Open .ncu-rep, check:
+   □ Compute throughput % — are tensor cores busy?
+   □ Memory throughput % — is HBM saturated?
+   □ Warp stall reasons — what are warps waiting for?
+   □ Occupancy — how many warps are active?
+   □ Register count — am I spilling to local memory?
+6. Identify bottleneck:
+   - Low compute throughput + high memory → need better data reuse (bigger tiles)
+   - High compute + low memory → compute-bound (good! means GEMM is big enough)
+   - Warp stalls on memory → prefetch, pipeline, or reduce shared memory pressure
+   - Low occupancy → reduce registers per thread or shared memory per block
+7. Fix the bottleneck (30 min)
+8. Re-profile with Nsight Compute (step 4)
+9. Repeat until:
+   - Compute-bound kernels: ≥60% of hardware peak TFLOPS
+   - Memory-bound kernels: ≥70% of hardware peak bandwidth
+   - Or: diminishing returns (last iteration gained <5%)
+10. Tile size sweep with triton.testing.do_bench (10 min):
+    for BM in [64, 128, 256]:
+      for BK in [32, 64, 128]:
+        bench(BM, BK) → record ms
+    Pick optimal tile size.
+
+Total per kernel: 2-4 hours of Nsight iterations.
+Total for 4 kernels: 8-16 hours (1-2 days).
+```
+
+---
+
+## Appendix E: File Structure
 
 ```
 nanoseek/benchmarks/
-├── README.md                          # This guide (condensed)
-├── profile_baseline.py                # Stage 0: PyTorch profiler
-├── component_timing.py                # Stage 0: CUDA event timing
-├── memory_profile.py                  # Stage 0: Memory breakdown
-├── mfu.py                             # Stage 0: MFU calculation
-├── attention_benchmarks.py            # Stage 1: FA implementations
-├── moe_benchmarks.py                  # Stage 2: Grouped GEMM
-├── swiglu_benchmarks.py               # Stage 3: Fused activation
-├── fp8_precision_benchmarks.py        # Stage 4: Quantization error
-├── fp8_overhead_benchmarks.py         # Stage 4: Quant kernel time
-├── training_comparison.py             # Stage 5: Loss curve A/B
-├── roofline.py                        # Roofline plot generation
-├── traces/                            # Chrome traces from profiler
-│   ├── baseline/                      # Stage 0 traces
-│   ├── nanofuse/                      # Post-optimization traces
-│   └── *.json                         # Chrome trace exports
-├── results/                           # Benchmark results (CSV/JSON)
-│   ├── baseline_profile.md            # Stage 0 report
-│   ├── grouped_gemm_comparison.csv    # Stage 2 data
-│   ├── swiglu_comparison.csv          # Stage 3 data
-│   ├── fp8_precision.csv              # Stage 4 data
-│   └── training_comparison.csv        # Stage 5 data
-└── plots/                             # Generated charts
-    ├── roofline_rtx4090.png
-    ├── attention_scaling.png
-    ├── moe_speedup.png
-    └── loss_curves_comparison.png
+├── profile_baseline.py        # 30-line torch.profiler script
+├── bench_moe.py               # grouped vs batched BMM comparison
+├── bench_swiglu.py            # fused vs standard SwiGLU
+├── bench_fp8.py               # blockwise vs tensorwise precision
+├── bench_training.py          # 500-step A/B loss curve comparison
+├── traces/                    # Perfetto traces
+└── ncu_reports/               # Nsight Compute .ncu-rep files
 ```
 
 ---
@@ -1639,9 +1665,9 @@ nanoseek/benchmarks/
 
 | Stage | Days | Key Question | Key Metric | Pass Criterion |
 |-------|------|-------------|------------|----------------|
-| **0** | 1-3 | Where does time go? | % per component | MoE > 30% |
-| **1** | 4-10 | Can you write GPU kernels? | FA vs SDPA time | ≤ 1.2x SDPA |
-| **2** | 11-18 | Does grouped GEMM beat batched? | Speedup ratio | ≥ 1.5x |
-| **3** | 19-22 | Does fusion save memory? | Peak MB reduction | ≥ 40% |
-| **4** | 23-28 | Does blockwise beat tensorwise? | Relative error | ≥ 2x lower |
-| **5** | 29-35 | Does training still converge? | BPB deviation | < 0.5% |
+| **Profile** | Day 1 | Where does time go? | % per component | MoE > 30% |
+| **Grouped GEMM** | Days 2-5 | Does grouped beat batched? | Speedup + Nsight | ≥ 1.5x |
+| **Fused SwiGLU** | Days 6-7 | Does fusion save memory? | Peak MB + bandwidth | ≥ 40% mem, ≥70% BW |
+| **Blockwise FP8** | Days 8-10 | Does blockwise beat tensorwise? | Relative error | ≥ 2x lower |
+| **Training** | Days 13-14 | Does training still converge? | BPB deviation | < 0.5% |
+| **Ship** | Day 20 | Is it ready? | Tests pass, blog written | All green |
