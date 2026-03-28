@@ -1,6 +1,6 @@
 # NanoSeek — Claude Code Context File
 ## Project: Research-Grade DeepSeek V3.2 at Nano Scale
-### Last updated: 2026-03-15 | Phase: Implementation (model Sections 1-7 complete, training infra active)
+### Last updated: 2026-03-25 | Phase: Implementation (model complete, ablation-first plan active)
 
 ---
 
@@ -27,7 +27,7 @@ Phase 1 (MOSTLY COMPLETE): model/ implementation
   ✅ config.py: All configs correct (gamma_freeze_ratio=0.95, beta2=0.95, etc.)
   ❌ Sections 8-9: Lightning Indexer + DSA (Phase 2 only, empty placeholders)
 
-Phase 2 (MOSTLY COMPLETE): Training infrastructure
+Phase 2 (COMPLETE): Training infrastructure
   ✅ EMA tracking (pre_train.py EMATracker, decay=0.9999, every 10 steps)
   ✅ Batch warmup (1/5 → 1× over first 10%)
   ✅ FLOPs = 6 × N_active
@@ -39,7 +39,15 @@ Phase 2 (MOSTLY COMPLETE): Training infrastructure
   ❌ DSA two-stage LR (Phase 2 only)
   ✅ Checkpoint resume (--resume-from-step loads model/optimizer/EMA/dataloader state)
 
-Phase 3 (NOT STARTED): Anchor HP search + stability ablations + nano-500M validation (Option B)
+Phase 2.5 (COMPLETE): FP8 training framework + optimization plan
+  ✅ nanoseek/fp8.py — MoE-aware FP8 (~320 lines, tensorwise scaling, E4M3/E5M2)
+  ✅ --fp8 flag in pre_train.py (auto-detects H100+, graceful fallback)
+  ✅ disable_fp8() eval escape hatch (BF16 eval for clean val_bpb)
+  ✅ Gate router + embeddings protected from FP8 conversion
+  ✅ TRAINING_OPTIMIZATION_PLAN.md — 7-phase roadmap with first-principles docs
+  ⚠️  MLA lora ranks not FP8-aligned (275, 90, 440, 143 not ÷16) — MLA stays BF16
+
+Phase 3 (READY — needs GPU pod): Gate 1 smoke test → HP search → full ablation training
 Phase 4 (NOT STARTED): NanoSeek-1B training (22B tokens)
 Phase 5 (IN PROGRESS): RL post-training
   ✅ Single-stage GRPO with 4 V3.2 MoE stabilization techniques
@@ -48,8 +56,8 @@ Phase 5 (IN PROGRESS): RL post-training
   ❌ 3-stage pipeline (Reasoning→Agent→General + cross-stage distillation)
 ```
 
-**What to work on next**: Run Gate 1 checks. If passing, start Phase 3 (anchor HP search).
-For Phase 2 DSA: implement Sections 8-9 after Phase 1 4K training completes.
+**What to work on next**: Spin up RunPod → download data → Gate 1 smoke test → 6×500-step HP search.
+All code is complete. 124 tests passing. See `RESEARCH_PLAN.md` for full plan.
 
 ---
 
@@ -202,9 +210,11 @@ nanoseek/                           ← PROJECT ROOT (this directory)
 ├── MLA_PRODUCTION_VERIFIED_PLAN.md ← MLA verification plan
 │
 ├── nanoseek/                       ← CORE PACKAGE (model, config, data, training infra)
-│   ├── config.py                   ← All model configs (anchor/500M/1B), gamma=0.95, beta2=0.95
+│   ├── config.py                   ← All model configs (anchor/ablation/1B), gamma=0.95, beta2=0.95
 │   ├── model.py                    ← Sections 1-7 complete (MLA, Gate, MoE, MTP, DecoderLayer, NanoSeekModel)
 │   │                                  Sections 8-9 (Indexer, DSA) are Phase 2 placeholders
+│   ├── fp8.py                      ← FP8 training: Float8CastLinear, _Float8Matmul, disable_fp8()
+│   │                                  MoE-aware conversion, tensorwise scaling, E4M3/E5M2, --fp8 flag
 │   ├── dataloader.py               ← BOS-aligned best-fit packing + FIM 10% PSM (RULE 6)
 │   ├── dataset.py                  ← Parquet dataset listing, NANOSEEK_DATA_DIR support
 │   ├── tokenizer.py                ← Tokenizer with FIM token support (get_fim_tokens)
@@ -269,6 +279,9 @@ nanoseek/                           ← PROJECT ROOT (this directory)
 ❌ DON'T skip cross-stage distillation — it prevents capability forgetting
 ❌ DON'T use generative reward models at 1B scale — stick with verifiable rewards
 ❌ DON'T ignore MTP acceptance rate during RL — it's a test-time scaling signal
+❌ DON'T FP8-ify the gate router — routing precision is sacred (fp8.py:_is_fp8_eligible)
+❌ DON'T use --fp8 on Ampere (A100/A6000) — no FP8 tensor cores, would be slower
+❌ DON'T evaluate with FP8 — disable_fp8() ensures BF16 eval for clean val_bpb
 ```
 
 ---
@@ -276,7 +289,14 @@ nanoseek/                           ← PROJECT ROOT (this directory)
 ## Key Numbers to Memorize
 
 ```
-Architecture:
+Architecture (ablation — PRIMARY experimental scale):
+  N_active = ~410M     N_total = ~1.95B    expansion = 4.8×
+  n_layers = 16        n_experts = 64      top_k = 8     κ = 12.5%
+  hidden_dim = 1280    moe_inter = 480     G ≈ 28 (Krajewski optimal: 16-32)
+  Training tokens = 8.2B  Cost/run = ~$35
+  Same depth (16L) as 1B → only width varies → clean HP transfer
+
+Architecture (1B — graduation run):
   N_active = 1.08B     N_total = 4.75B     expansion = 4.4×
   n_layers = 16        n_experts = 64      top_k = 8     κ = 12.5%
   hidden_dim = 2048    moe_inter = 768     G ≈ 29 (Krajewski optimal: 16-32)
@@ -298,10 +318,10 @@ Quality targets:
   MFU target: 47%
   HP transfer validation: nano-500M trains successfully with auto-scaled HPs
 
-Option B validation path (3 points, muP-aligned):
-  muP anchor (16L, 480h, ~55M active) → nano-500M (16L, 1280h, ~441M active) → NanoSeek-1B (16L, 2048h, 1.08B active)
-  All configs: 64 experts, top-8, κ=12.5%, moe_inter=0.375×hidden, 2 shared experts
-  Research question: do muP-corrected scaling rules (√B + 1/width + T_epoch) transfer to MoE?
+Two-scale strategy (same depth, only width varies):
+  ablation (16L, 1280h, ~410M active) → PRIMARY: HP search, dynamics, ALL experiments ($35/run)
+  1b (16L, 2048h, 1.08B active) → graduation run after experiments prove out ($350/run)
+  Both: 16 layers, 64 experts, top-8, κ=12.5%, moe_inter=0.375×hidden, 2 shared experts
 ```
 
 ---
@@ -363,9 +383,10 @@ COMPLETED  Model Sections 1-7, config, dataloader (FIM), pre_train.py (EMA, eval
            checkpoint resume, config validation), data curation, eval framework,
            single-stage GRPO, reward functions, SFT warmup. Tests: 115 passing.
 
-NEXT       Phase 3: Anchor HP search (~55M active) on GPU
-           → Verify Gate 1 manual checks (H_load > 4 bits, MTP ~50%, FIM ~10%)
-           → nano-500M validation → NanoSeek-1B training (22B tokens)
+NEXT       Smoke test at ablation scale → 6 × 500-step HP search at ablation (~$42)
+           → Full ablation training (8.2B tokens, ~$35)
+           → Stability experiments at ablation (~$20)
+           → 1B graduation run (22B tokens, ~$350)
 
 LATER      Phase 2 DSA: model.py Sections 8-9 (Indexer + DSA) after 4K training
            3-stage GRPO pipeline (RULE 8): dpo.py, agent_environment.py,

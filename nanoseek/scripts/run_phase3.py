@@ -24,7 +24,7 @@ Usage:
     python -m nanoseek.scripts.run_phase3 --stop-after day1
 
     # Skip to Day 2 (assumes Day 1 results in W&B)
-    python -m nanoseek.scripts.run_phase3 --start-from 500m-transfer
+    python -m nanoseek.scripts.run_phase3 --start-from ablation-transfer
 """
 
 import argparse
@@ -49,9 +49,9 @@ STAGES = [
     "stability",
     "architecture",
     "hp-analysis",      # pick best HP from grid
-    "500m-transfer",
+    "ablation-transfer",
     "mup-check",        # verify muP hypothesis
-    "500m-grid",        # CONDITIONAL: only if muP fails
+    "ablation-grid",        # CONDITIONAL: only if muP fails
     "1b-training",
     "scaling-law-fit",
     "final-report",
@@ -71,9 +71,20 @@ class PipelineState:
     total_cost_estimate: float = 0.0
 
     def save(self):
-        os.makedirs(os.path.dirname(PIPELINE_STATE_FILE), exist_ok=True)
-        with open(PIPELINE_STATE_FILE, "w") as f:
+        """Save pipeline state atomically (write to .tmp, fsync, rename).
+
+        Without atomic writes, a crash during json.dump leaves a corrupt
+        state file that prevents pipeline resume. This matches the
+        checkpoint_manager.py pattern for crash safety.
+        """
+        dirpath = os.path.dirname(PIPELINE_STATE_FILE)
+        os.makedirs(dirpath, exist_ok=True)
+        tmp_path = PIPELINE_STATE_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(asdict(self), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, PIPELINE_STATE_FILE)  # atomic on Linux
 
     @classmethod
     def load(cls) -> "PipelineState":
@@ -274,7 +285,7 @@ def check_mup_transfer(state: PipelineState, dry_run: bool = False) -> bool:
         print("  [DRY RUN] Would check muP transfer hypothesis")
         return True
 
-    ckpt_dir = os.path.join("checkpoints", "nanoseek_500m", "hp-500m-transfer")
+    ckpt_dir = os.path.join("checkpoints", "nanoseek_ablation", "hp-ablation-transfer")
     metadata_files = sorted(Path(ckpt_dir).glob("metadata_*.json")) if os.path.exists(ckpt_dir) else []
 
     if not metadata_files:
@@ -415,7 +426,7 @@ def stage_hp_analysis(state: PipelineState, dry_run: bool):
     state.mark_complete("hp-analysis")
 
 
-def stage_500m_transfer(state: PipelineState, dry_run: bool, seed: int):
+def stage_ablation_transfer(state: PipelineState, dry_run: bool, seed: int):
     """Stage: 500M transfer validation with best anchor HP."""
     print("\n" + "█" * 70)
     print("  STAGE: 500M muP Transfer Validation (~14 hrs)")
@@ -427,13 +438,13 @@ def stage_500m_transfer(state: PipelineState, dry_run: bool, seed: int):
     print(f"  Using best anchor HP: matrix_lr={mlr}, embedding_lr={elr}")
 
     result = run_training(
-        "hp-500m-transfer", "500m",
+        "hp-ablation-transfer", "ablation",
         ["--matrix-lr", str(mlr), "--embedding-lr", str(elr),
          "--eval-every", "500", "--save-every", "2000"],
         dry_run=dry_run, seed=seed,
     )
-    state.run_results["hp-500m-transfer"] = result
-    state.mark_complete("500m-transfer")
+    state.run_results["hp-ablation-transfer"] = result
+    state.mark_complete("ablation-transfer")
 
 
 def stage_mup_check(state: PipelineState, dry_run: bool):
@@ -454,11 +465,11 @@ def stage_mup_check(state: PipelineState, dry_run: bool):
     state.mark_complete("mup-check")
 
 
-def stage_500m_grid(state: PipelineState, dry_run: bool, seed: int):
+def stage_ablation_grid(state: PipelineState, dry_run: bool, seed: int):
     """Stage: CONDITIONAL — 500M grid search (only if muP fails)."""
     if state.mup_transfer_passed:
         print("\n  SKIPPING 500M grid (muP transfer passed)")
-        state.mark_complete("500m-grid")
+        state.mark_complete("ablation-grid")
         return
 
     print("\n" + "█" * 70)
@@ -471,16 +482,16 @@ def stage_500m_grid(state: PipelineState, dry_run: bool, seed: int):
     for factor in [0.5, 1.0, 2.0, 4.0]:
         mlr = base_mlr * factor
         elr = state.best_hp.get("embedding_lr", 0.3)
-        name = f"hp-500m-grid-mlr{mlr:.4f}"
+        name = f"hp-ablation-grid-mlr{mlr:.4f}"
         result = run_training(
-            name, "500m",
+            name, "ablation",
             ["--matrix-lr", str(mlr), "--embedding-lr", str(elr),
              "--eval-every", "500", "--save-every", "2000"],
             dry_run=dry_run, seed=seed,
         )
         state.run_results[name] = result
 
-    state.mark_complete("500m-grid")
+    state.mark_complete("ablation-grid")
 
 
 def stage_1b_training(state: PipelineState, dry_run: bool, seed: int):
@@ -519,7 +530,7 @@ def stage_scaling_law_fit(state: PipelineState, dry_run: bool):
     # Collect ema_val_bpb from each scale
     scales = [
         ("anchor", "stab-A-baseline", 55e6),
-        ("500m", "hp-500m-transfer", 441e6),
+        ("ablation", "hp-ablation-transfer", 441e6),
         ("1b", "nanoseek-1b-v1", 1080e6),
     ]
 
@@ -544,7 +555,7 @@ def stage_scaling_law_fit(state: PipelineState, dry_run: bool):
     if len(data_points) >= 2 and not dry_run:
         # Build CLI args for scaling_law.py
         run_args = []
-        names = ["anchor", "500m", "1b"]
+        names = ["anchor", "ablation", "1b"]
         for i, (n, bpb) in enumerate(data_points):
             run_args.extend(["--runs", f"{names[i]}:{n:.0f}:{bpb:.4f}"])
 
@@ -622,9 +633,9 @@ STAGE_FUNCTIONS = {
     "stability": stage_stability,
     "architecture": stage_architecture,
     "hp-analysis": stage_hp_analysis,
-    "500m-transfer": stage_500m_transfer,
+    "ablation-transfer": stage_ablation_transfer,
     "mup-check": stage_mup_check,
-    "500m-grid": stage_500m_grid,
+    "ablation-grid": stage_ablation_grid,
     "1b-training": stage_1b_training,
     "scaling-law-fit": stage_scaling_law_fit,
     "final-report": stage_final_report,
@@ -632,7 +643,7 @@ STAGE_FUNCTIONS = {
 
 # Stages that need (state, dry_run, seed) vs (state, dry_run)
 STAGES_WITH_SEED = {"gate1", "hp-grid", "stability", "architecture",
-                    "500m-transfer", "500m-grid", "1b-training"}
+                    "ablation-transfer", "ablation-grid", "1b-training"}
 
 
 def main():

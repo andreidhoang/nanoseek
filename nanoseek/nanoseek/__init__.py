@@ -22,7 +22,7 @@ from .config import (
     YaRNConfig,
     TrainingPhaseConfig,
     get_nanoseek_config,
-    get_nanoseek_500m_config,
+    get_nanoseek_ablation_config,
     get_nanoseek_anchor_config,
     get_training_phases,
 )
@@ -44,7 +44,7 @@ __all__ = [
     "YaRNConfig",
     "TrainingPhaseConfig",
     "get_nanoseek_config",
-    "get_nanoseek_500m_config",
+    "get_nanoseek_ablation_config",
     "get_nanoseek_anchor_config",
     "get_training_phases",
     "NanoSeekModel",

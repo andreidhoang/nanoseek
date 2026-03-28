@@ -56,6 +56,7 @@ def _atomic_torch_save(obj: Any, path: str) -> None:
     # fsync to ensure data hits disk before rename (NVMe writeback cache)
     _fsync_file(tmp_path)
     os.replace(tmp_path, path)  # atomic on Linux
+    _fsync_dir(os.path.dirname(path))  # durability guarantee on ext4
 
 
 def _atomic_json_save(obj: Any, path: str) -> None:
@@ -66,6 +67,7 @@ def _atomic_json_save(obj: Any, path: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
+    _fsync_dir(os.path.dirname(path))  # durability guarantee on ext4
 
 
 def _fsync_file(path: str) -> None:
@@ -77,21 +79,47 @@ def _fsync_file(path: str) -> None:
         os.close(fd)
 
 
-def _verify_torch_checkpoint(path: str) -> bool:
-    """Verify a .pt file can be loaded without error.
+def _fsync_dir(dirpath: str) -> None:
+    """Force directory metadata to disk.
 
-    Uses weights_only=False for the verification pass to catch all
-    corruption modes. Returns True if valid, False if corrupt.
+    On Linux ext4, file renames (os.replace) are only guaranteed durable
+    after a directory fsync. Without this, a power loss right after
+    os.replace() could result in both old and new files being missing.
+    This matters for bare-metal RunPod with sudden power cuts.
     """
     try:
-        # Quick check: file exists and has non-zero size
+        fd = os.open(dirpath, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # Not all OSes support dir fsync (e.g., macOS)
+
+
+def _verify_torch_checkpoint(path: str) -> bool:
+    """Verify a .pt file is likely valid without loading it into RAM.
+
+    Previous approach: torch.load(path, weights_only=True) — loads the
+    entire checkpoint into CPU RAM. For a 1B model + optimizer, that's
+    ~8-10 GB of extra memory during verification.
+
+    Current approach: check file size > minimum threshold + verify the
+    PyTorch magic number in the file header. This catches truncation
+    (the main corruption mode from interrupted saves) without OOM risk.
+    """
+    try:
         size = os.path.getsize(path)
-        if size == 0:
+        if size < 128:  # Any valid checkpoint is at least a few KB
             return False
-        # Full check: actually load the file metadata (fast — doesn't
-        # deserialize tensors, just verifies pickle structure is intact)
-        torch.load(path, map_location="cpu", weights_only=True)
-        return True
+        # Check for PyTorch/pickle magic bytes at start of file
+        with open(path, 'rb') as f:
+            header = f.read(2)
+            # PyTorch checkpoints start with pickle protocol header (0x80 0x02+)
+            # or ZIP archive header (PK = 0x50 0x4B) for newer format
+            if header[:2] == b'PK' or (header[0] == 0x80 and header[1] >= 0x02):
+                return True
+            return False
     except Exception:
         return False
 

@@ -122,6 +122,7 @@ def compute_i_spec(
     # Compute I_spec per layer
     n_layers = len(collector.router_inputs)
     i_spec_per_layer = []
+    h_expert = 0.0  # default if no layers (prevents NameError at line 172)
 
     for layer_idx in range(n_layers):
         router_input = collector.router_inputs[layer_idx].float().numpy()  # [N, D]

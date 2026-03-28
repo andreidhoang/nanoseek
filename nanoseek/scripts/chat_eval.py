@@ -48,8 +48,8 @@ from tqdm import tqdm
 from nanoseek.nanoseek.config import (
     NanoSeekConfig,
     get_nanoseek_config,
-    get_nanoseek_500m_config,
-    get_nanoseek_anchor_config,
+    get_nanoseek_ablation_config,
+    get_nanoseek_anchor_config,  # kept for backwards compat
 )
 from nanoseek.nanoseek.model import NanoSeekModel
 from nanoseek.nanoseek.common import (
@@ -80,8 +80,7 @@ def load_nanoseek_model(
 ) -> Tuple[NanoSeekModel, NanoSeekConfig, Any, Optional[Dict]]:
     """Load a NanoSeek model with optional EMA weights."""
     config_map = {
-        "anchor": get_nanoseek_anchor_config,
-        "500m": get_nanoseek_500m_config,
+        "ablation": get_nanoseek_ablation_config,
         "1b": get_nanoseek_config,
     }
     if scale not in config_map:
@@ -442,7 +441,7 @@ def main():
     # Model settings
     parser.add_argument(
         '--scale', type=str, default='1b',
-        choices=['anchor', '500m', '1b'],
+        choices=['ablation', '1b'],
         help='NanoSeek model scale'
     )
     parser.add_argument(

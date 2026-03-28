@@ -24,7 +24,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from nanoseek.nanoseek.config import get_nanoseek_anchor_config, get_nanoseek_config
+from nanoseek.nanoseek.config import get_nanoseek_ablation_config, get_nanoseek_config
 from nanoseek.nanoseek.model import NanoSeekModel
 
 
@@ -385,14 +385,14 @@ def profile_moe_breakdown(model, x, device, is_cuda, num_runs=5):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Profile MoE dispatch performance")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda", "mps"])
-    parser.add_argument("--scale", type=str, default="anchor", choices=["anchor", "1b"])
+    parser.add_argument("--scale", type=str, default="ablation", choices=["ablation", "1b"])
     parser.add_argument("--compile", action="store_true", help="Apply torch.compile")
     parser.add_argument("--runs", type=int, default=15, help="Number of timed runs")
     parser.add_argument("--warmup", type=int, default=5, help="Number of warmup runs")
     args = parser.parse_args()
 
-    if args.scale == "anchor":
-        config = get_nanoseek_anchor_config()
+    if args.scale == "ablation":
+        config = get_nanoseek_ablation_config()
     else:
         config = get_nanoseek_config()
 

@@ -2,7 +2,7 @@
 
 **A complete account of why every major decision was made, what research it rests on, and what the project ultimately aims to prove.**
 
-*Last updated: 2026-03-18*
+*Last updated: 2026-03-25 — Revised for ablation-first, 2-scale design*
 
 ---
 
@@ -37,7 +37,7 @@ Modern frontier MoE models (DeepSeek V3, Mixtral, GPT-4) demonstrate that sparse
 
 3. **A complete, educational implementation** of DeepSeek V3's innovations (MLA, auxiliary-loss-free routing, MTP, DSA) that a single researcher can understand, train, and experiment with.
 
-NanoSeek addresses all three by building a ~1.13B-active / ~4.9B-total MoE from first principles, with every design choice traceable to a specific paper and derivation.
+NanoSeek addresses all three by building MoE models at two scales — ablation (~410M active / ~1.95B total) and graduation (1.08B active / 4.75B total) — from first principles, with every design choice traceable to a specific paper and derivation.
 
 ---
 
@@ -47,15 +47,15 @@ The project produces five artifacts, each with falsifiable success criteria:
 
 | Artifact | Success Criterion | Why It Matters |
 |----------|------------------|----------------|
-| **Trained NanoSeek-1B checkpoint** | Converged ema_val_bpb, H_load > 2 bits | Proves the architecture works at this scale |
-| **muP HP transfer report** | 3-point validation (55M → 441M → 1.08B) without per-scale tuning | First empirical test of muP for MoE |
-| **Stability playbook** | 3 ablations (A, C, D) with documented H_load/I_spec trajectories | Actionable knowledge for MoE training stability |
-| **Scaling law fit** | L(N_active, D, E) with R² > 0.95 from EMA validation BPB | Quantitative model for MoE compute-optimal training |
+| **Trained NanoSeek-Ablation checkpoint** | Converged ema_val_bpb, H_load > 2 bits, 8.2B tokens | Primary experimental model at DeepSeek's proven ablation scale |
+| **Trained NanoSeek-1B checkpoint** | Converged ema_val_bpb, H_load > 2 bits, 22B tokens | Graduation run proving HPs transfer from ablation scale |
+| **MoE Training Dynamics Report** | Expert specialization timeline, routing stability heatmaps, MTP×routing correlation | Deepest public analysis of MoE training dynamics |
+| **Stability playbook** | Bad batch recovery, aux-loss-free verification, early warning signals | Actionable knowledge for MoE training stability |
 | **3-stage RL pipeline** | GSM8K/HumanEval improvement at 3 compute budgets | Validates staged RL for small MoE |
 
-The overarching scientific question: **Can muP-corrected scaling rules transfer to MoE architectures, enabling cheap hyperparameter search at small scale to predict large-scale training behavior?**
+The overarching scientific question: **What are the training dynamics of MoE models — when do experts specialize, what predicts collapse, how does data mixture affect routing — and do these dynamics transfer across scales?**
 
-If yes, this makes MoE training accessible to researchers without frontier-scale compute.
+This matters because every lab running MoE at scale fights expert collapse, routing instability, and mysterious divergences. Our instrumented pipeline produces the monitoring knowledge that doesn't exist in open literature.
 
 ---
 
@@ -193,18 +193,18 @@ For MoE architectures, additional rules apply:
 - Training duration T_epoch can be transferred with appropriate LR schedule adjustment
 
 **Consequence for NanoSeek:**
-Our 3-point muP transfer path (anchor 55M → 500M → 1.08B) holds constant:
-- Depth: 16 layers (all three configs)
-- Expert count: 64 (all three)
-- top_k: 8 (all three)
-- κ: 12.5% (all three)
-- moe_inter/hidden: 0.375 (all three)
-- n_shared_experts: 2 (all three)
-- MLA ratios: q_lora/h=0.215, kv_lora/h=0.070 (all three)
+Our 2-scale design (ablation 1280h → 1B 2048h) holds constant:
+- Depth: 16 layers (both configs)
+- Expert count: 64 (both)
+- top_k: 8 (both)
+- κ: 12.5% (both)
+- moe_inter/hidden: 0.375 (both)
+- n_shared_experts: 2 (both)
+- MLA ratios: q_lora/h=0.215, kv_lora/h=0.070 (both)
 
-Only hidden_size changes: 480 → 1280 → 2048. This is exactly what muP requires — vary the "width" axis while holding everything else constant.
+Only hidden_size changes: 1280 → 2048. This is exactly what muP requires — vary the "width" axis while holding everything else constant. Same depth means no depth-transfer confound.
 
-The research question: **Does this actually work for MoE?** No published empirical validation exists. Our 3-point path tests it.
+**Design choice**: We do HP search DIRECTLY at ablation scale (not via muP proxy transfer), because ablation runs are cheap enough ($7/run for 500 steps). muP scaling is still used when transferring best HPs from ablation to 1B — the width ratio is 1.6× (well within validated range).
 
 ### Law 7: Knowledge Capacity
 
@@ -266,14 +266,15 @@ LOAD BALANCING:
   Monitor: H_load > 2 bits throughout
          │
          ▼  (muP: width-only scaling)
-TRANSFER PATH:
-  anchor (480h) → 500M (1280h) → 1B (2048h)
-  Depth=16, E=64, κ=12.5% constant everywhere
-  HP search at anchor ($5), validate at 500M ($30), run at 1B ($300)
+TWO-SCALE DESIGN:
+  ablation (1280h, 16L, ~410M active, ~1.95B total) — PRIMARY
+  1b (2048h, 16L, 1.08B active, 4.75B total) — GRADUATION
+  Same depth (16L), E=64, κ=12.5% constant
+  HP search at ablation ($7/run), full train ($35), graduate to 1B ($350)
          │
          ▼
 FINAL ARCHITECTURE:
-  1.08B active / 4.75B total MoE
+  Two trained models: ablation (~410M) + 1B (1.08B active)
   MLA + SwiGLU + aux-loss-free routing + MTP + DSA
 ```
 
@@ -306,13 +307,14 @@ At G=29: expert_params = 4.66M → moe_inter = 758.
 
 With E=256: we'd need 256 experts of 4.66M each, giving N_total = 256 × 4.66M + shared ≈ 1.4B. This is problematic:
 - Expansion ratio only 1.3× (barely MoE)
-- At anchor scale (480h), each expert would be ~65K params — too small for SwiGLU to learn meaningful patterns
+- At ablation scale (1280h), each expert would be ~1.2M params — viable but sparse
 
 With E=64: N_total = 64 × 4.66M + shared ≈ 4.75B. Expansion = 4.4×.
 - Matches OLMoE-1B's validated configuration
-- At anchor scale, each expert has ~255K params — still viable for specialization
+- At ablation scale, each expert has 1.84M params — robust for specialization
+- DeepSeek's own 2B ablation used exactly E=64 at d=1280
 
-**The expert count is constrained by the anchor scale viability requirement for muP transfer.** This is a practical constraint, not a theoretical preference.
+**The expert count is validated by both OLMoE-1B and DeepSeek's own ablation practice.** This is an empirically grounded choice, not a theoretical preference.
 
 ### Sparsity ratio κ = 12.5%
 
@@ -382,12 +384,11 @@ q_lora_rank / hidden = 440 / 2048 = 0.215
 kv_lora_rank / hidden = 143 / 2048 = 0.070
 ```
 
-These ratios are maintained across our muP transfer path:
-- Anchor: q_lora=103, kv_lora=34 (0.215 × 480, 0.070 × 480)
-- 500M: q_lora=275, kv_lora=90 (0.215 × 1280, 0.070 × 1280)
+These ratios are maintained across both scales:
+- Ablation: q_lora=275, kv_lora=90 (0.215 × 1280, 0.070 × 1280)
 - 1B: q_lora=440, kv_lora=143 (0.215 × 2048, 0.070 × 2048)
 
-**Why trust DeepSeek's ratios?** They trained at 671B total parameters with extensive ablations. At our scale, the compression ratio matters less (the cache is already small), but maintaining the ratio is necessary for muP transfer validity.
+**Why trust DeepSeek's ratios?** They trained at 671B total parameters with extensive ablations. At our scale, the compression ratio matters less (the cache is already small), but maintaining the ratio ensures architectural consistency and enables clean HP transfer.
 
 ---
 
@@ -410,18 +411,17 @@ Additional constraints beyond dense muP:
 3. **κ must be constant**: top_k/E is an architectural ratio, not a scaling variable
 4. **E must be constant**: Expert count is not a width; varying it changes the model class
 
-### Our 3-point validation design
+### Our 2-scale design (ablation-first)
 
 ```
-Scale        │ hidden │ N_active │ Compute │ Purpose
-─────────────┼────────┼──────────┼─────────┼───────────────
-Anchor (55M) │  480   │  ~55M    │   ~$5   │ HP search (grid)
-500M         │  1280  │  ~441M   │  ~$30   │ Transfer validation
-1B (target)  │  2048  │  ~1.08B  │  ~$300  │ Final model
+Scale            │ hidden │ Layers │ N_active │ Compute │ Purpose
+─────────────────┼────────┼────────┼──────────┼─────────┼──────────────────
+Ablation (PRIMARY)│ 1280  │  16    │  ~410M   │  ~$35   │ HP search, dynamics, all experiments
+1B (graduation)  │  2048  │  16    │  ~1.08B  │  ~$350  │ Final model (once)
 ```
 
-Constants across all three:
-- num_layers = 16
+Constants across both:
+- num_layers = 16 (SAME DEPTH — only width varies)
 - n_routed_experts = 64
 - num_experts_per_tok = 8
 - κ = 12.5%
@@ -430,18 +430,22 @@ Constants across all three:
 - MLA compression ratios (q_lora/h=0.215, kv_lora/h=0.070)
 - MLA head dims: qk_nope=128, qk_rope=64, v=128 (fixed constants, not ratios)
 
-**Success criterion:** nano-500M trains to reasonable ema_val_bpb using auto-scaled HPs from anchor, without manual tuning. If manual tuning is needed, we document which scaling rule broke and why.
+**Why direct search at ablation, not muP proxy transfer:**
+- Ablation HP search costs $42 (6×500 steps) — cheap enough to search directly
+- No transfer risk: we measure the actual ablation-scale loss landscape
+- muP still used for the ablation→1B transfer (width ratio 1.6×, well within validated range)
+- Published HPs from DeepSeek V3/V2-Lite bracket the optimal range
 
-### What this would prove
+**Success criterion:** Best ablation HPs, when muP-scaled to 1B, produce a converging run without manual tuning. The dynamics patterns (I_spec trajectory, routing stability) should be qualitatively similar across both scales.
 
-If muP transfer works for MoE:
-- HP search cost drops from ~$300 (at 1B) to ~$5 (at anchor)
-- Any researcher with a single GPU can find good HPs for a larger MoE
-- Scaling law predictions become more reliable (HPs are consistent across scales)
+### What this proves
 
-If it fails:
-- We document which muP assumption breaks for MoE (still valuable)
-- We fall back to per-scale tuning (more expensive but still feasible)
+The ablation-first approach answers a different (and more practical) question than the original muP-only plan:
+
+**Instead of**: "Does muP transfer work for MoE?" (binary yes/no)
+**We answer**: "What are the training dynamics of MoE, and do they transfer across scales?" (rich, publishable)
+
+The dynamics report (I_spec timeline, routing stability, expert gradient equality) is the primary scientific output — it doesn't exist anywhere in open literature.
 
 ---
 
@@ -581,22 +585,21 @@ NanoSeek is a "wide" architecture: high knowledge capacity (2048 width + 4.75B t
 3. 16 layers provides adequate reasoning depth for a 1B-class model
 4. The d/L = 128 ratio matches OLMoE-1B, which published competitive results
 
-### Implications for the muP transfer path
+### Implications for the 2-scale design
 
-Our transfer path uses constant depth (16 layers) across all scales:
+Both scales use constant depth (16 layers):
 
 | Config | Layers | Hidden | d/L |
 |--------|--------|--------|-----|
-| Anchor | 16 | 480 | 30 |
-| 500M | 16 | 1280 | 80 |
+| Ablation | 16 | 1280 | 80 |
 | 1B | 16 | 2048 | 128 |
 
-The d/L ratio changes — this means the anchor has relatively more depth (reasoning-oriented) while the 1B has relatively more width (knowledge-oriented). Allen-Zhu's framework predicts:
-- The anchor may show disproportionately good reasoning for its size
+The d/L ratio changes — the ablation has relatively more depth (reasoning-oriented) while the 1B has relatively more width (knowledge-oriented). Allen-Zhu's framework predicts:
+- The ablation may show disproportionately good reasoning for its size
 - The 1B may show disproportionately good knowledge recall for its size
 - BPB (which combines both) should still follow the scaling law smoothly
 
-This is a known confound — we document it rather than trying to eliminate it (which would require varying depth, breaking muP).
+**Why same depth is critical**: With 16L at both scales, only width varies. This means HP transfer (via muP width-scaling rules) is clean — no depth confound. The d/L difference is a known consequence, not a transfer-breaking issue.
 
 ---
 
@@ -638,9 +641,9 @@ One of this project's principles is intellectual honesty about the source of eac
 
 | Component | What we take | Confidence |
 |-----------|-------------|------------|
-| κ-constant rule | Keep top_k/E constant across scales | Medium — theoretical, we test empirically |
-| Expert LR scaling | Expert weights scale as 1/width | Medium — extends dense muP to MoE |
-| Router LR constant | Router is "output weight" class | Medium — theoretical prediction |
+| κ-constant rule | Keep top_k/E constant across scales | Medium — both configs use κ=12.5% |
+| Expert LR scaling | Expert weights scale as 1/width | Medium — used for ablation→1B transfer |
+| Router LR constant | Router is "output weight" class | Medium — applied in pre_train.py |
 
 ### From DeepSeekMoE (arXiv:2401.06066) — small-scale MoE precedent
 
@@ -676,7 +679,7 @@ One of this project's principles is intellectual honesty about the source of eac
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
 | **Expert collapse despite aux-loss-free** | Low (10%) | Catastrophic — model is 200M dense | H_load monitoring every step; alert at H_load < 2 bits; manual bias reset protocol |
-| **muP transfer fails for MoE** | Medium (30%) | Scientific — no HP transfer validation | Document which rule breaks; fall back to per-scale tuning; still a novel negative result |
+| **Ablation→1B HP transfer fails** | Low (15%) | Must re-tune at 1B ($30 extra) | Same depth (16L), width ratio only 1.6× — well within muP validated range; fallback: 2 quick HP runs at 1B |
 | **BF16 numerical instability** | Low (15%) | Training diverges | Grad clip 1.0; QK-norm in MLA; stability ablations (runs A, C, D) |
 
 ### Important risks (degrade quality but don't invalidate)
@@ -702,35 +705,37 @@ One of this project's principles is intellectual honesty about the source of eac
 
 The project is complete when these five conditions hold simultaneously:
 
-### 1. Trained NanoSeek-1B checkpoint
-- EMA weights available
+### 1. Trained NanoSeek-Ablation checkpoint
+- EMA weights available (8.2B tokens, d=1280, 16 layers)
 - Final ema_val_bpb measured on held-out set
 - H_load > 2 bits at final step (no expert collapse)
+- I_spec increases over training (experts are specializing)
 - MTP acceptance rate > 75%
 
-### 2. muP HP transfer validated
-- 3-point path: anchor (55M) → 500M → 1B
-- 500M trained with auto-scaled HPs from anchor
-- 1B trained with auto-scaled HPs from anchor
-- Report documenting which rules held and which (if any) broke
-- File: `scaling_law_lab/report/HP_TRANSFER_REPORT.md`
+### 2. Trained NanoSeek-1B checkpoint (graduation run)
+- EMA weights available (22B tokens, d=2048, 16 layers)
+- Trained with best HPs from ablation (muP width-scaled)
+- H_load > 2 bits throughout
+- Dynamics patterns match ablation qualitatively
 
-### 3. Stability ablations complete
-- Run A: Full config (baseline)
-- Run C: No QK-norm (isolates QK-norm contribution)
-- Run D: No aux-loss-free (isolates load balancing contribution)
-- Each with H_load and I_spec trajectories
-- SwiGLU confound documented (Allen-Zhu Part 3.3)
-- File: `stability_engine/report/STABILITY_PLAYBOOK.md`
+### 3. MoE Training Dynamics Report
+- Expert specialization timeline (I_spec vs training fraction, both scales)
+- Per-layer routing entropy, Gini, churn heatmaps
+- Expert gradient norms (per expert per layer)
+- MTP×routing correlation (MTP acceptance vs I_spec)
+- Gate logit statistics evolution
+- Domain BPB (code/math/science/web/books)
+- Ablation→1B dynamics comparison
+- File: `reports/TRAINING_DYNAMICS_REPORT.md`
 
-### 4. Scaling law fit
-- L(N_active, D, E) = L_irr + A/N_active^α + B/D^β + γ·log(E)
-- Fit from EMA validation BPB across sweep points
-- R² > 0.95
-- Knowledge capacity analysis (Allen-Zhu Part 3.3)
-- Depth-stratified analysis (Allen-Zhu Parts 1, 2.1)
+### 4. Stability playbook
+- Bad batch recovery at ablation scale
+- Aux-loss-free vs classic comparison (I_spec trajectories)
+- Data mixture → routing interaction
+- Early warning signals for expert collapse
+- File: `reports/STABILITY_PLAYBOOK.md`
 
-### 5. 3-stage RL post-training
+### 5. 3-stage RL post-training (Month 2)
 - Stage 1: Reasoning RL (GRPO, 60% budget)
 - Stage 2: Agent RL (GRPO, 25% budget)
 - Stage 3: General Alignment (DPO, 15% budget)
@@ -738,7 +743,7 @@ The project is complete when these five conditions hold simultaneously:
 - All 4 V3.2 MoE stabilization techniques active
 - Test-time scaling curve: accuracy vs inference tokens
 - MTP acceptance as test-time scaling signal
-- File: `docs/RL_SCALING_REPORT.md`
+- File: `reports/RL_SCALING_REPORT.md`
 
 ---
 
@@ -842,7 +847,7 @@ Five techniques adapted from nanochat/gpt.py (Karpathy's training codebase) afte
 
 **Provenance**: DeepSeek V3 Technical Report: *"All learnable parameters are randomly initialized with a standard deviation of 0.006."* This is a flat constant — no layer-dependent scaling (the earlier `0.006/√(2*n_layers)` GPT-2/GPT-3 pattern was incorrect for this architecture). The flat σ=0.006 provides sufficient gradient signal to the router at init while keeping output projections near-identity.
 
-**muP compatibility**: The flat σ=0.006 is a constant initializer independent of width, so it composes cleanly with muP's per-layer LR scaling. The same σ is used at anchor (480h), 500M (1280h), and 1B (2048h) scales.
+**muP compatibility**: The flat σ=0.006 is a constant initializer independent of width, so it composes cleanly with muP's per-layer LR scaling. The same σ is used at ablation (1280h) and 1B (2048h) scales.
 
 ### 14.3 Logit Softcap
 
@@ -872,7 +877,7 @@ Five techniques adapted from nanochat/gpt.py (Karpathy's training codebase) afte
 
 **Provenance**: GPT-3 (Brown et al., 2020) used `1/√(2·n_layers·hidden)` for residual projections. nanochat/gpt.py lines 217–224. We use `1/√hidden_size` for general weights combined with DeepSeek V3's flat σ=0.006 for output projections (which replaces the depth-scaled pattern).
 
-**muP compatibility**: Strongly positive. muP's width scaling rule `η ∝ 1/width` for hidden weights assumes variance-preserving init. Fixed `std = 0.02` violates this assumption at non-target widths. Width-dependent init means the anchor, 500M, and 1B configs all start with the same activation dynamics, making muP transfer more reliable.
+**muP compatibility**: Strongly positive. muP's width scaling rule `η ∝ 1/width` for hidden weights assumes variance-preserving init. Fixed `std = 0.02` violates this assumption at non-target widths. Width-dependent init means the ablation and 1B configs start with the same activation dynamics, making HP transfer more reliable.
 
 ### Summary of Interaction Effects
 
@@ -896,16 +901,15 @@ The embedding table (input `embed_tokens` + output `lm_head`, untied) scales as 
 
 | Scale | hidden | 65K vocab embed | % of active | 32K vocab embed | % of active |
 |-------|--------|-----------------|-------------|-----------------|-------------|
-| Anchor | 480 | 63M | **114%** | 31M | **57%** |
-| 500M | 1280 | 168M | 38% | 84M | 21% |
-| 1B | 2048 | 268M | 24.8% | 134M | 14.2% |
+| Ablation | 1280 | 168M | 41% | 84M | **20%** |
+| 1B | 2048 | 268M | 24.8% | 134M | **14.2%** |
 
-At 65K vocab, the anchor's embedding table is *larger than the entire model's active capacity*. This distorts muP transfer because the anchor measures embedding learning dynamics, not transformer dynamics.
+At 65K vocab, the ablation's embedding table consumes 41% of active params — a significant tax that reduces transformer capacity.
 
 ### Decision: vocab_size = 32,768
 
 **Why 32K over 65K:**
-1. **muP transfer reliability** — Embedding:transformer ratio is more consistent across scales. At 32K, anchor embed is 57% of active (still high, but manageable) vs 114% at 65K.
+1. **Embedding tax reduction** — At 32K, ablation embed is 20% of active (manageable) vs 41% at 65K. This keeps the transformer as the dominant component.
 2. **134M freed params at 1B** — These params go into transformer capacity (experts, MLA) rather than storing rare token embeddings.
 3. **MTP acceptance rate** — Smaller vocab → fewer possible continuations → easier next-token prediction → higher speculative decoding acceptance rate. MTP acceptance is a measured scientific output (RULE 9).
 4. **Number tokenization** — The `\p{N}{1,2}` split pattern (grouping at most 2 digits) is validated optimal for ≤32K vocab (nanochat LOG.md). 3-digit grouping wastes token space on rare combos at this vocab size.

@@ -168,27 +168,34 @@ class YaRNConfig:
 @dataclass
 class FP8Config:
     """
-    FP8 (8-bit floating point) training and inference configuration.
+    FP8 (8-bit floating point) training configuration.
 
-    Requires NVIDIA H100/H200 with Transformer Engine for native FP8.
-    Provides ~2x memory reduction and ~1.5x speed improvement.
+    Requires NVIDIA H100/H200 (SM 9.0+) for native FP8 tensor cores.
 
-    Reference: DeepSeek-V3 uses FP8 for both weights and activations
+    NanoSeek's FP8 strategy (see nanoseek/fp8.py for full details):
+    - Tensorwise dynamic scaling (1 scale per tensor, cuBLAS native)
+    - E4M3 for weights/activations (forward), E5M2 for gradients (backward)
+    - Selective: MLA projections + shared expert get FP8
+    - Protected: gate router, embeddings, RMSNorm stay BF16/FP32
+    - Batched MoE dispatch stays BF16 (torch.bmm, not _scaled_mm)
+    - Evaluation always in BF16 (disable_fp8 context manager)
+
+    Activated via: --fp8 flag in pre_train.py
+    Reference: DeepSeek-V3 uses block-wise FP8 (1 scale per 128 elements);
+               we use tensorwise (simpler, no custom kernels needed at nano scale)
     """
-    # Enable FP8 (requires H100/H200)
+    # Enable FP8 (requires H100/H200, activated via --fp8 CLI flag)
     enabled: bool = False
 
-    # Computation format
-    dtype: Literal["bf16", "fp8"] = "bf16"
+    # Scaling recipe: "tensorwise" is the only supported recipe
+    # (block-wise would require CUTLASS/Triton custom kernels)
+    scaling_recipe: str = "tensorwise"
 
-    # Block size for block-based quantization
-    block_size: int = 128
+    # Minimum dimension for FP8 conversion (below this, overhead > benefit)
+    min_dim: int = 128
 
-    # Scale format for quantization
-    scale_fmt: Optional[str] = None
-
-    # Use delayed scaling for better training stability
-    use_delayed_scaling: bool = True
+    # Hardware alignment requirement for FP8 tensor cores
+    alignment: int = 16
 
 
 @dataclass
@@ -1017,7 +1024,7 @@ def get_nanoseek_config() -> NanoSeekConfig:
         # MLA Configuration (DeepSeek V3 ratios at 2048 scale)
         # ====================================================================
         mla=MLAConfig(
-            q_lora_rank=440,           # 0.215 × 2048 = 440 (muP ratio must match anchor/500M)
+            q_lora_rank=440,           # 0.215 × 2048 = 440 (muP ratio must match anchor/ablation)
             kv_lora_rank=143,          # 0.07 × 2048 = 143 ✓
             qk_nope_head_dim=128,      # DeepSeek family constant (V2-Lite/V2/V3 all use 128)
             qk_rope_head_dim=64,       # DeepSeek family constant (all use 64)
@@ -1110,58 +1117,88 @@ def get_nanoseek_config() -> NanoSeekConfig:
 
 
 # ============================================================================
-# NanoSeek-500M Configuration (muP intermediate, G≈30)
+# NanoSeek Ablation Configuration (PRIMARY experimental scale, G≈28)
 # ============================================================================
 
-def get_nanoseek_500m_config() -> NanoSeekConfig:
+def get_nanoseek_ablation_config() -> NanoSeekConfig:
     """
-    NanoSeek-500M: muP-aligned intermediate config for HP transfer validation.
+    NanoSeek Ablation: PRIMARY experimental scale for HP search and dynamics research.
 
     DESIGN PHILOSOPHY:
     ==================
-    This configuration is the INTERMEDIATE VALIDATION point in Option B's
-    3-point muP transfer path: anchor (55M) → 500M → 1B.
-    Architecture ratios MUST match NanoSeek-1B exactly for muP transfer:
-      - num_layers = 16 (same depth as 1B — muP transfers across width, not depth)
-      - κ = top_k/n_experts = 8/64 = 12.5% (constant sparsity ratio)
-      - moe_inter/hidden = 0.375 (constant expert shape ratio)
-      - n_shared_experts = 2 (constant shared expert count)
+    This is the scale where 90% of experiments happen. Designed to match
+    DeepSeek's proven 2B ablation config (d=1280, ~300M active) as closely
+    as possible while keeping NanoSeek's architectural features (MLA, MTP).
 
-    PARAMETER COUNT (muP-aligned):
-    ==============================
-    Component breakdown:
-    - Embeddings:      32768 × 1280 × 2 = 84M (always active)
-    - MLA (16 layers): 16 × ~2.0M = 32M (always active)
-    - Dense FFN (2):   2 × 12.6M = 25M (always active)
-    - Shared experts:  14 × 2 × 1.47M = 41M (always active)
-    - Routed active:   14 × 8 × 1.47M = 165M (8 of 64 experts)
-    - Router + norms:  ~10M
+    WHY d=1280, 16 LAYERS:
+    ======================
+    DeepSeek validated their MoE design at d=1280, 9 layers, 64 experts,
+    ~300M active, 100B tokens (DeepSeekMoE paper, 2401.06066). This is the
+    SMALLEST scale where MoE routing dynamics are proven to be meaningful.
+
+    We use 16 layers (matching 1B) because:
+    1. Same depth as 1B → HPs transfer cleanly (no depth mismatch)
+    2. Only width varies between ablation and 1B (1280 → 2048)
+    3. ~$10 more per run vs 12 layers, but eliminates HP transfer risk
+    4. d/L = 1280/16 = 80 (reasonable; 1B is 128)
+
+    WHY THIS IS BETTER THAN 1B AS PRIMARY:
+    =======================================
+    | Property          | Ablation (d=1280) | 1B (d=2048) |
+    |-------------------|-------------------|-------------|
+    | Cost per full run | ~$35              | ~$350       |
+    | Experiments/$650  | ~18               | ~1.5        |
+    | MoE dynamics      | Proven at scale   | Same        |
+    | HP search cost    | $7/run (500 steps)| $15/run     |
+    | Depth match       | 16L = same as 1B  | 16L         |
+
+    PARAMETER COUNT:
+    ================
+    Component breakdown (16 layers, first_k_dense_replace=1):
+    - Embeddings:       32768 × 1280 × 2 = 84M (always active)
+    - MLA (16 layers):  16 × ~2.0M = 32M (always active)
+    - Dense FFN (1):    1 × 8.4M = 8.4M (always active)
+    - Shared experts:   15 × 2 × 1.84M = 55M (always active)
+    - Routed active:    15 × 8 × 1.84M = 221M (8 of 64 experts)
+    - Router + norms:   ~10M
 
     TOTALS:
-    - Active: 168 + 32 + 25 + 41 + 165 + 10 = ~441M
-    - Total:  168 + 32 + 25 + 41 + (64×1.47M×14) + 10 = ~1.59B + 276M = ~2.1B
-    - Expansion: ~2.1B / 0.44B = ~4.8× (matches 1B's 4.4× within tolerance)
+    - Active: 84 + 32 + 8.4 + 55 + 221 + 10 = ~410M
+    - Total:  84 + 32 + 8.4 + 55 + (64×1.84M×15) + 10 = ~1.95B
+    - Expansion: ~1.95B / 0.41B = ~4.8× (close to 1B's 4.4×)
 
-    EXPERT SHAPE (muP-consistent, Krajewski G-preserving):
-    =====================================================
+    EXPERT SHAPE (Krajewski G-preserving):
+    ======================================
     - moe_intermediate_size = floor(0.375 × 1280) = 480
-      (ratio 0.375 derived from 1B's G≈29 target, held constant for muP)
     - Expert params = 3 × 1280 × 480 = 1.84M per expert
-    - G = 441M / (8 × 1.84M) ≈ 30 (within Krajewski optimal 16-32 ✓)
-    - κ = 8/64 = 12.5% (constant across all configs for muP transfer)
+    - G = 410M / (8 × 1.84M) ≈ 28 (within Krajewski optimal 16-32 ✓)
+    - κ = 8/64 = 12.5% (same as 1B)
+
+    COMPARISON TO DEEPSEEK's 2B ABLATION:
+    ======================================
+    | Property       | DeepSeek 2B   | NanoSeek Ablation |
+    |----------------|---------------|-------------------|
+    | d_model        | 1280          | 1280              |
+    | Layers         | 9             | 16                |
+    | Experts        | 64, top-7     | 64, top-8         |
+    | Active params  | ~300M         | ~410M             |
+    | Total params   | ~2.0B         | ~1.95B            |
+    | Attention      | standard MHA  | MLA (23× KV comp) |
 
     TRAINING:
     =========
-    - Tokens: 8.8B (Chinchilla optimal: 20 × 441M)
-    - Purpose: Validate that muP-transferred HPs from anchor produce good training
+    - Tokens: 8.2B (Chinchilla optimal: 20 × 410M)
+    - Full run cost: ~$35 on A6000
+    - HP search (500 steps): ~$7/run
+    - Purpose: PRIMARY scale for all experiments
     """
     return NanoSeekConfig(
         # ====================================================================
-        # Core Architecture (scaled from 1B)
+        # Core Architecture (matches DeepSeek 2B ablation scale)
         # ====================================================================
         vocab_size=32768,             # Same vocabulary (32K across all scales)
-        hidden_size=1280,             # Scaled down from 2048
-        num_layers=16,                # MUST match 1B for muP transfer (depth constant)
+        hidden_size=1280,             # DeepSeek's proven ablation width
+        num_layers=16,                # Same depth as 1B → only width varies → clean HP transfer
         num_heads=10,                 # head_dim = 1280/10 = 128 (standard)
 
         # Dense FFN (for first_k_dense_replace layers)
@@ -1230,9 +1267,9 @@ def get_nanoseek_500m_config() -> NanoSeekConfig:
         ),
 
         # ====================================================================
-        # Training Configuration (Chinchilla optimal: 8.8B ≈ 20 × 441M active)
+        # Training Configuration (Chinchilla optimal: 8.2B ≈ 20 × 410M active)
         # ====================================================================
-        total_tokens=8_800_000_000,      # 8.8B tokens (Chinchilla for ~441M active)
+        total_tokens=8_200_000_000,      # 8.2B tokens (Chinchilla for ~410M active)
         global_batch_size=128,           # Same batch size
         sequence_length=4096,            # Same 4K context
 
@@ -1243,8 +1280,8 @@ def get_nanoseek_500m_config() -> NanoSeekConfig:
         adam_beta1=0.9,
         adam_beta2=0.95,
 
-        # LR Schedule (same ratios)
-        warmup_steps=500,                # Scaled from 1000 (fewer total steps)
+        # LR Schedule
+        warmup_steps=500,
         constant_phase_ratio=0.70,
         cosine_decay_end_ratio=0.95,
 
@@ -1258,8 +1295,8 @@ def get_nanoseek_500m_config() -> NanoSeekConfig:
         log_every_steps=10,
         eval_every_steps=250,
 
-        # Distributed
-        data_parallel_size=8,
+        # Distributed (can run on 1-4 GPUs)
+        data_parallel_size=4,
     )
 
 
@@ -1276,9 +1313,24 @@ def get_nanoseek_anchor_config() -> NanoSeekConfig:
       - moe_inter/hidden = 0.375 (constant expert shape ratio)
       - n_shared_experts = 2 (constant shared expert count)
 
+    WHY d=768 (NOT d=480):
+    ======================
+    MLA uses FIXED head dims (qk_nope=128, qk_rope=64, v=128) across all
+    model sizes — these are DeepSeek family constants, NOT ratios of hidden_size.
+    W_O projects n_heads × v_head_dim → hidden_size. For this to be a square
+    (non-lossy) matrix, we need: n_heads × 128 = hidden_size.
+
+    At d=480, n_heads=6: W_O is 768→480 (LOSSY rectangular projection).
+    At d=768, n_heads=6: W_O is 768→768 (SQUARE, correct geometry).
+
+    The entire muP path now has correct W_O geometry:
+      d=768  (anchor, 6 heads):  6 × 128 = 768  = d ✓
+      d=1280 (ablation, 10 heads): 10 × 128 = 1280 = d ✓
+      d=2048 (1B,    16 heads): 16 × 128 = 2048 = d ✓
+
     muP TRANSFER THEORY (Tensor Programs V + μP-MoE + Complete(d)P):
     ================================================================
-    - Width is the ONLY free variable (480 → 1280 → 2048)
+    - Width is the ONLY free variable (768 → 1280 → 2048)
     - Hidden weight LRs scale as 1/fan_in across widths
     - Expert weights are "hidden weights" (LR ∝ 1/width)
     - Router weights are "output weights" (LR constant)
@@ -1286,39 +1338,42 @@ def get_nanoseek_anchor_config() -> NanoSeekConfig:
 
     PARAMETER COUNT:
     ================
-    - Embeddings:      32768 × 480 × 2 = 31M (always active)
-    - MLA (16 layers): 16 × ~0.28M = 4.5M (always active)
-    - Dense FFN (2):   2 × 1.77M = 3.5M (always active)
-    - Shared experts:  14 × 2 × 0.26M = 7.3M (always active)
-    - Routed active:   14 × 8 × 0.26M = 29M (8 of 64 experts)
-    - Router + norms:  ~2M
+    - Embeddings:      32768 × 768 × 2 = 50M (always active)
+    - MLA (16 layers): 16 × ~1.1M = 17M (always active)
+    - Dense FFN (1):   1 × 4.5M = 4.5M (always active)
+    - Shared experts:  15 × 2 × 0.66M = 20M (always active)
+    - Routed active:   15 × 8 × 0.66M = 80M (8 of 64 experts)
+    - Router + norms:  ~3M
 
     TOTALS:
-    - Active: 31 + 4.5 + 3.5 + 7.3 + 29 + 2 ≈ 77M (32K vocab halves embedding tax)
-    - Total:  31 + 4.5 + 3.5 + 7.3 + (64×0.26M×14) + 2 ≈ 282M
-    - Expansion: ~282M / 77M ≈ 3.7× (improved from 2.9× with 65K vocab)
+    - Active: 50 + 17 + 4.5 + 20 + 80 + 3 ≈ 175M
+    - Total:  50 + 17 + 4.5 + 20 + (64×0.66M×15) + 3 ≈ 730M
+    - Expansion: ~730M / 175M ≈ 4.2× (close to 1B's 4.4×)
+    - Non-embed active: ~125M (for Chinchilla token budget)
 
     NOTE: Anchor quality doesn't need to be high — it only needs to find
     good HP ratios that transfer to larger scales via muP rules.
     """
     return NanoSeekConfig(
         # ====================================================================
-        # Core Architecture (muP anchor — width=480, depth=16 matching 1B)
+        # Core Architecture (muP anchor — width=768, depth=16 matching 1B)
         # ====================================================================
+        # d=768 is the SMALLEST width where MLA geometry is correct:
+        # n_heads × v_head_dim = 6 × 128 = 768 = hidden_size (W_O is square)
         vocab_size=32768,             # Same vocabulary (32K across all scales)
-        hidden_size=480,              # muP anchor width (transfers to 1280→2048)
+        hidden_size=768,              # muP anchor width (transfers to 1280→2048)
         num_layers=16,                # MUST match 1B (depth constant in muP)
-        num_heads=6,                  # head_dim = 480/6 = 80
+        num_heads=6,                  # 6 × 128 = 768 = d (W_O is square ✓)
 
         # Dense FFN (for first_k_dense_replace layers)
-        intermediate_size=1229,       # 2.56 × 480 (DeepSeek ratio preserved)
+        intermediate_size=1966,       # 2.56 × 768 = 1966 (DeepSeek ratio preserved)
 
         # ====================================================================
-        # MLA Configuration (DeepSeek V3 ratios at 480 scale)
+        # MLA Configuration (DeepSeek V3 ratios at 768 scale)
         # ====================================================================
         mla=MLAConfig(
-            q_lora_rank=103,           # 0.215 × 480 = 103
-            kv_lora_rank=34,           # 0.070 × 480 = 34
+            q_lora_rank=165,           # 0.215 × 768 = 165
+            kv_lora_rank=54,           # 0.070 × 768 = 54
             qk_nope_head_dim=128,      # DeepSeek family constant (V2-Lite/V2/V3 all use 128)
             qk_rope_head_dim=64,       # DeepSeek family constant (all use 64)
             v_head_dim=128,            # DeepSeek family constant (all use 128)
@@ -1333,7 +1388,7 @@ def get_nanoseek_anchor_config() -> NanoSeekConfig:
             n_routed_experts=64,         # 64 experts (κ=8/64=12.5%)
             num_experts_per_tok=8,       # 8 active (12.5% ratio preserved)
             n_shared_experts=2,          # Must match 1B (2 shared experts)
-            moe_intermediate_size=180,   # floor(0.375 × 480) = 180
+            moe_intermediate_size=288,   # floor(0.375 × 768) = 288
 
             # Routing configuration (8 groups of 8 experts)
             n_group=8,
@@ -1376,7 +1431,7 @@ def get_nanoseek_anchor_config() -> NanoSeekConfig:
         # ====================================================================
         # Training Configuration (short runs for HP grid search)
         # ====================================================================
-        total_tokens=1_100_000_000,     # ~1.1B tokens (20 × 55M non-embed active)
+        total_tokens=2_500_000_000,     # ~2.5B tokens (20 × 125M non-embed active)
         global_batch_size=64,           # Smaller for anchor scale
         sequence_length=4096,
 

@@ -122,8 +122,11 @@ def compute_domain_bpb(
         results[domain] = round(bpb, 4)
         logger.info(f"Domain '{domain}' BPB: {bpb:.4f}")
 
-    # Also compute overall weighted BPB
-    total_loss_all = sum(results[d] for d in results)
-    results['overall'] = round(total_loss_all / max(len(results), 1), 4)
+    # Overall BPB: simple average across domains (each domain has ~same byte count
+    # from the built-in prompts, so unweighted average is appropriate here)
+    if results:
+        results['overall'] = round(sum(results.values()) / len(results), 4)
+    else:
+        results['overall'] = float('inf')
 
     return results

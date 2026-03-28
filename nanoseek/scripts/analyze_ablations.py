@@ -185,8 +185,8 @@ HYPOTHESES = [
         group="hp-transfer",
         description="muP-scaled anchor HP achieves ema_val_bpb within 0.02 of 500M grid optimum",
         metric="ema_val/bpb",
-        baseline_run="hp-500m-transfer",
-        variant_run="hp-500m-grid",  # best grid run
+        baseline_run="hp-ablation-transfer",
+        variant_run="hp-ablation-grid",  # best grid run
         direction="within",
         threshold=0.02,
         unit="BPB",
@@ -632,7 +632,7 @@ def generate_cost_report(runs: List[dict]) -> str:
     # Approximate $/hr by GPU type (RunPod 2026 pricing)
     cost_per_hour = {
         "anchor": 0.44,   # 1x RTX 4090
-        "500m": 3.29,     # 1x H100
+        "ablation": 3.29,     # 1x H100
         "1b": 26.32,      # 8x H100
     }
 

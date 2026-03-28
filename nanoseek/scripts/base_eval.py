@@ -32,7 +32,7 @@ Examples:
         --max-per-task=100 --split-tokens=524288 --eval bpb,sample
 
     # Evaluate only BPB on validation split
-    python -m nanoseek.scripts.base_eval --scale 500m --eval bpb --split-tokens=1048576
+    python -m nanoseek.scripts.base_eval --scale ablation --eval bpb --split-tokens=1048576
 """
 
 import os
@@ -58,8 +58,8 @@ import torch.distributed as dist
 from nanoseek.nanoseek.config import (
     NanoSeekConfig,
     get_nanoseek_config,
-    get_nanoseek_500m_config,
-    get_nanoseek_anchor_config,
+    get_nanoseek_ablation_config,
+    get_nanoseek_anchor_config,  # kept for backwards compat; not a training scale
 )
 from nanoseek.nanoseek.model import NanoSeekModel
 from nanoseek.nanoseek.common import (
@@ -89,7 +89,7 @@ def load_nanoseek_model(
     Load a NanoSeek model with optional EMA weights.
     
     Args:
-        scale: Model scale ('anchor', '500m', '1b')
+        scale: Model scale ('ablation', '1b')
         device: Device to load model on
         checkpoint_dir: Directory containing checkpoints (default: checkpoints/nanoseek_{scale})
         step: Specific step to load (default: latest)
@@ -103,8 +103,7 @@ def load_nanoseek_model(
     """
     # Get config for scale
     config_map = {
-        "anchor": get_nanoseek_anchor_config,
-        "500m": get_nanoseek_500m_config,
+        "ablation": get_nanoseek_ablation_config,
         "1b": get_nanoseek_config,
     }
     if scale not in config_map:
@@ -596,7 +595,7 @@ def main():
     # Model source (NanoSeek or HuggingFace)
     parser.add_argument(
         '--scale', type=str, default='1b',
-        choices=['anchor', '500m', '1b'],
+        choices=['ablation', '1b'],
         help='NanoSeek model scale to evaluate'
     )
     parser.add_argument(
