@@ -23,6 +23,163 @@ No FP8 tensor cores (limited FP8 via software emulation — not useful)
 
 ---
 
+## The Profiling Hierarchy: Top-Down, Always
+
+**Rule**: Profile top-down. Stop when you find the bottleneck. Never start at the kernel level — you might optimize the wrong kernel.
+
+```
+Level 0:  Full training step (forward + backward + optimizer)
+          → "How fast is my training?"
+          → Answers: tokens/sec, step_time, MFU
+          → Time: 5 min to profile
+
+Level 1:  Forward vs Backward vs Optimizer (3 segments)
+          → "Which phase dominates?"
+          → Expected: backward ≈ 2-3x forward, optimizer ≈ 5-15%
+          → Time: 5 min
+
+Level 2:  Per-layer breakdown (16 layers)
+          → "Are all layers equal, or is one a bottleneck?"
+          → MoE layers are NOT equal — routing patterns differ across layers
+          → Time: 15 min
+
+Level 3:  Per-component within a layer
+          → "Within one layer, what's the bottleneck?"
+          → THIS is where you find: expert compute = 50%, MLA = 20%
+          → Time: 30 min
+
+Level 4:  Individual kernel (Nsight Compute)
+          → "Is this specific GEMM compute-bound or memory-bound?"
+          → Roofline analysis, bandwidth measurement, bank conflicts
+          → Time: 1-2 hours
+```
+
+### Why Per-Layer Profiling Matters for MoE (Not Dense)
+
+```
+Dense model: every layer is ~identical (same ops, same shapes)
+  → Profiling 1 layer tells you about all 16
+
+MoE model: layers can DIFFER because:
+  1. Routing patterns evolve across layers
+     (early layers: broad routing, late layers: specialized)
+  2. Load imbalance varies per layer
+     (some layers have dead experts, others have balanced routing)
+  3. Padding waste differs per layer
+     (waste_ratio could be 1.1 in layer 0, 1.8 in layer 15)
+
+So for MoE: you MUST profile multiple layers, not just one.
+```
+
+**Per-layer profiling reveals hidden bottlenecks:**
+
+```
+┌─────────┬──────────┬────────────┬────────────┬──────────────┐
+│ Layer   │ Total ms │ MoE ms (%) │ MLA ms (%) │ waste_ratio  │
+├─────────┼──────────┼────────────┼────────────┼──────────────┤
+│ Layer 0 │ 2.31     │ 1.18 (51%) │ 0.42 (18%) │ 1.45         │
+│ Layer 1 │ 2.28     │ 1.15 (50%) │ 0.41 (18%) │ 1.38         │
+│ ...     │ ...      │ ...        │ ...        │ ...          │
+│ Layer 8 │ 2.42     │ 1.28 (53%) │ 0.43 (18%) │ 1.62 ← worst│
+│ ...     │ ...      │ ...        │ ...        │ ...          │
+│ Layer 15│ 2.19     │ 1.08 (49%) │ 0.40 (18%) │ 1.22         │
+└─────────┴──────────┴────────────┴────────────┴──────────────┘
+
+Insight: Layer 8 is 10% slower than average because waste_ratio=1.62.
+         The gate router sends 62% more tokens to its most popular expert
+         than the average expert gets. Grouped GEMM eliminates this waste.
+```
+
+### How to Profile Each Level
+
+**Level 0 — Full Step** (CUDA events):
+```python
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+
+for step in range(warmup + measured):
+    start.record()
+    loss = model(x, targets=y)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    end.record()
+    torch.cuda.synchronize()
+    if step >= warmup:
+        step_times.append(start.elapsed_time(end))
+```
+
+**Level 1 — Three-Phase Split**:
+```python
+fwd_start.record()
+loss = model(x, targets=y)
+fwd_end.record()
+
+bwd_start.record()
+loss.backward()
+bwd_end.record()
+
+opt_start.record()
+optimizer.step()
+opt_end.record()
+
+torch.cuda.synchronize()
+# Result: forward=15ms, backward=38ms, optimizer=4ms
+# Backward dominates (67%) → optimize forward FIRST (backward scales with it)
+```
+
+**Level 2 — Per-Layer Hooks**:
+```python
+layer_times = {}
+for i, layer in enumerate(model.layers):
+    def make_hooks(idx):
+        def pre_hook(module, input):
+            module._start = torch.cuda.Event(enable_timing=True)
+            module._start.record()
+        def post_hook(module, input, output):
+            module._end = torch.cuda.Event(enable_timing=True)
+            module._end.record()
+        return pre_hook, post_hook
+    pre, post = make_hooks(i)
+    layer.register_forward_pre_hook(pre)
+    layer.register_forward_hook(post)
+
+# After forward + synchronize:
+for i, layer in enumerate(model.layers):
+    layer_times[i] = layer._start.elapsed_time(layer._end)
+```
+
+**Level 3 — Per-Component Within a Layer** (see Stage 0.2 below for full implementation).
+
+**Level 4 — Individual Kernel via NVTX + Nsight Compute**:
+```python
+import torch.cuda.nvtx as nvtx
+
+# Add NVTX markers around specific operations
+def expert_forward_with_markers(self, padded_input):
+    nvtx.range_push("expert_bmm_gate_up")
+    gate = torch.bmm(padded_input, stacked_gate_weights)
+    up = torch.bmm(padded_input, stacked_up_weights)
+    nvtx.range_pop()
+
+    nvtx.range_push("expert_swiglu")
+    h = F.silu(gate) * up
+    nvtx.range_pop()
+
+    nvtx.range_push("expert_bmm_down")
+    out = torch.bmm(h, stacked_down_weights)
+    nvtx.range_pop()
+    return out
+```
+```bash
+# Profile ONLY the marked kernel (not the entire model):
+ncu --nvtx --nvtx-include "expert_bmm_gate_up" \
+    --set full -o expert_gate_profile \
+    python -m nanoseek.benchmarks.profile_kernel
+```
+
+---
+
 ## Stage 0: Baseline Profiling (Days 1-3)
 
 ### Objective
@@ -194,6 +351,127 @@ def time_nanoseek_components(model, batch, num_runs=20, warmup=5):
     for k, v in sorted(avg.items(), key=lambda x: -x[1]):
         print(f"  {k:30s}  {v:8.2f} ms  ({100*v/total:5.1f}%)")
     return avg
+```
+
+### 0.2b Per-Layer Variation Analysis (MoE-Specific)
+
+**What to measure**: Do all 16 layers have the same performance profile, or do some layers bottleneck?
+
+```python
+# File: nanoseek/benchmarks/per_layer_profile.py
+
+def profile_per_layer_variation(model, batch, num_runs=30, warmup=5):
+    """
+    Profile every layer independently to detect per-layer bottlenecks.
+
+    Why this matters for MoE but NOT for dense models:
+    ─────────────────────────────────────────────────
+    Dense: Layer 0 ≈ Layer 1 ≈ ... ≈ Layer 15 (identical structure, same shapes)
+           Profiling 1 layer = profiling all layers.
+
+    MoE:   Layer 0 ≠ Layer 8 ≠ Layer 15 because:
+           - Routing decisions differ (early=broad, late=specialized)
+           - Expert load balance varies (waste_ratio: 1.1 to 1.8)
+           - Dead expert count may differ across layers
+           - Padding waste directly impacts batched GEMM time
+
+    What to capture per layer:
+      1. Total forward time (ms)
+      2. MoE sub-time: gate + dispatch + compute + combine + shared
+      3. MLA sub-time: projections + attention + output
+      4. waste_ratio = max(expert_counts) / mean(expert_counts)
+      5. Gini coefficient of expert token counts
+      6. Number of dead experts (0 tokens assigned)
+
+    Output format:
+    ┌────────┬────────┬──────────┬──────────┬─────────────┬───────┬──────┐
+    │ Layer  │ Tot ms │ MoE ms   │ MLA ms   │ waste_ratio │ Gini  │ Dead │
+    ├────────┼────────┼──────────┼──────────┼─────────────┼───────┼──────┤
+    │ 0      │ 2.31   │ 1.18     │ 0.42     │ 1.45        │ 0.08  │ 0    │
+    │ 1      │ 2.28   │ 1.15     │ 0.41     │ 1.38        │ 0.07  │ 0    │
+    │ ...    │ ...    │ ...      │ ...      │ ...         │ ...   │ ...  │
+    │ 15     │ 2.19   │ 1.08     │ 0.40     │ 1.22        │ 0.05  │ 0    │
+    ├────────┼────────┼──────────┼──────────┼─────────────┼───────┼──────┤
+    │ StdDev │ 0.07   │ 0.06     │ 0.01     │ 0.13        │ 0.01  │ 0    │
+    │ Max/Min│ 1.10x  │ 1.19x    │ 1.08x    │             │       │      │
+    └────────┴────────┴──────────┴──────────┴─────────────┴───────┴──────┘
+
+    Decision criteria:
+    - If Max/Min ratio > 1.3x for MoE time: per-layer routing is unbalanced
+      → Consider per-layer bias tuning or layer-specific optimization
+    - If any layer has dead experts > 2: routing collapse in that layer
+      → Check gate bias update (gamma parameter)
+    - If StdDev of waste_ratio > 0.2: grouped GEMM gains vary by layer
+      → NanoFuse benefit is layer-dependent, report per-layer speedup
+    """
+    layer_data = {i: [] for i in range(len(model.layers))}
+    routing_data = {i: [] for i in range(len(model.layers))}
+
+    # Install hooks on every layer
+    hooks = []
+    for i, layer in enumerate(model.layers):
+        def make_timing_hooks(idx):
+            def pre_hook(module, input):
+                module._prof_start = torch.cuda.Event(enable_timing=True)
+                module._prof_start.record()
+            def post_hook(module, input, output):
+                module._prof_end = torch.cuda.Event(enable_timing=True)
+                module._prof_end.record()
+            return pre_hook, post_hook
+        pre, post = make_timing_hooks(i)
+        hooks.append(layer.register_forward_pre_hook(pre))
+        hooks.append(layer.register_forward_hook(post))
+
+    # Install routing hooks on every gate
+    for i, layer in enumerate(model.layers):
+        def make_routing_hook(idx):
+            def hook(module, input, output):
+                weights, indices = output[0], output[1]
+                flat = indices.view(-1)
+                counts = torch.bincount(flat, minlength=64).float()
+                routing_data[idx].append({
+                    'waste_ratio': (counts.max() / counts.mean()).item(),
+                    'gini': _compute_gini(counts).item(),
+                    'dead_experts': (counts == 0).sum().item(),
+                    'counts': counts.detach().cpu(),
+                })
+            return hook
+        hooks.append(layer.moe.gate.register_forward_hook(make_routing_hook(i)))
+
+    # Run forward passes
+    for run in range(warmup + num_runs):
+        with torch.no_grad():
+            _ = model(batch['input_ids'])
+        torch.cuda.synchronize()
+
+        if run >= warmup:
+            for i, layer in enumerate(model.layers):
+                t = layer._prof_start.elapsed_time(layer._prof_end)
+                layer_data[i].append(t)
+
+    # Cleanup hooks
+    for h in hooks:
+        h.remove()
+
+    # Report
+    print(f"{'Layer':>6} {'Median ms':>10} {'MoE Waste':>10} {'Gini':>6} {'Dead':>5}")
+    for i in range(len(model.layers)):
+        median_t = sorted(layer_data[i])[len(layer_data[i])//2]
+        avg_waste = sum(d['waste_ratio'] for d in routing_data[i]) / len(routing_data[i])
+        avg_gini = sum(d['gini'] for d in routing_data[i]) / len(routing_data[i])
+        max_dead = max(d['dead_experts'] for d in routing_data[i])
+        print(f"{i:6d} {median_t:10.3f} {avg_waste:10.3f} {avg_gini:6.3f} {max_dead:5d}")
+
+    return layer_data, routing_data
+
+
+def _compute_gini(counts):
+    """Gini coefficient: 0=perfectly balanced, 1=all tokens to one expert."""
+    sorted_counts = counts.sort().values
+    n = len(sorted_counts)
+    cumsum = sorted_counts.cumsum(0)
+    return (2 * (torch.arange(1, n+1, device=counts.device) * sorted_counts).sum()
+            / (n * sorted_counts.sum()) - (n + 1) / n)
 ```
 
 ### 0.3 Memory Profiling
