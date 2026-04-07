@@ -1038,7 +1038,7 @@ DAY 1-2: Tier 1 Quick Wins
 DAY 2-3: Tier 2
 [ ] T2.1: Fix torch.compile graph breaks
 [ ] T2.2: Cache expert weight stacks
-[ ] T2.3: Add NVTX markers
+[x] T2.3: Add NVTX markers (record_function in DecoderLayer + MoE subphases)
 [ ] T2.4: EMA update optimization
 [ ] T3.4: Test compile mode="max-autotune"
 [ ] Measure again: MFU=___%, tok/s=_____, step_time=____s

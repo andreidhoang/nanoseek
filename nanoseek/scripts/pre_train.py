@@ -141,6 +141,15 @@ parser.add_argument("--no-shared-experts", action="store_true",
                     help="Ablation: remove shared expert contribution (zero out)")
 parser.add_argument("--no-compile", action="store_true",
                     help="Skip torch.compile (useful for debugging or incompatible GPUs)")
+
+# ─── Profiling ───
+parser.add_argument("--profile-steps", type=str, default="",
+                    help="Comma-separated steps to profile with torch.profiler "
+                         "(e.g. '20,21,22'). Exports chrome traces to runs/<run>/. "
+                         "Zero overhead when empty.")
+parser.add_argument("--profile-memory", action="store_true",
+                    help="Enable per-phase memory timeline logging to wandb "
+                         "(after_fwd, after_bwd, after_optim, fragmentation)")
 # ─── Evaluation data ───
 parser.add_argument("--domain-eval-dir", type=str, default=None,
                     help="Directory with domain eval text files (code.txt, math.txt, etc.). "
@@ -176,6 +185,11 @@ parser.add_argument("--total-batch-size", type=int, default=-1,
 
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# Parse --profile-steps into a set of ints for O(1) lookup in the training loop
+_profile_steps = set()
+if args.profile_steps:
+    _profile_steps = {int(s.strip()) for s in args.profile_steps.split(",") if s.strip()}
 
 # -----------------------------------------------------------------------------
 # Seed management for reproducibility
@@ -250,43 +264,45 @@ def validate_config(cfg):
     print0("  Config validation: PASSED")
 
 # ─── Apply ablation overrides BEFORE validation ───
+# NOTE: config.moe / config.mtp are @property accessors returning a NEW
+# SimpleNamespace each call. Writing config.moe.X = Y modifies a temp object
+# and is silently discarded. Write to the FLAT config fields instead.
 if args.no_seq_aux:
-    config.moe.seq_aux_loss_alpha = 0.0
+    config.seq_aux_loss_alpha = 0.0
     print0("ABLATION: seq_aux disabled (alpha=0)")
 
 if args.aux_loss_type == "classic":
     # Classic aux loss: parametric alpha, no bias-based balancing
-    config.moe.seq_aux_loss_alpha = args.aux_loss_alpha
+    config.seq_aux_loss_alpha = args.aux_loss_alpha
     print0(f"ABLATION: classic aux loss (alpha={args.aux_loss_alpha}, bias updates will be skipped)")
 
 if args.no_mtp:
-    config.mtp.mtp_loss_weight_initial = 0.0
-    config.mtp.mtp_loss_weight_final = 0.0
-    print0("ABLATION: MTP disabled (lambda=0 throughout training)")
+    config.num_mtp_modules = 0
+    print0("ABLATION: MTP disabled (num_mtp_modules=0, no MTP module built)")
 
 if args.no_shared_experts:
-    config.moe.disable_shared_experts = True
+    config.disable_shared_experts = True
     print0("ABLATION: shared experts disabled (output zeroed)")
 
 # ─── Architecture overrides (must come before model build) ───
 if args.num_experts > 0:
-    old_e = config.moe.n_routed_experts
-    config.moe.n_routed_experts = args.num_experts
+    old_e = config.n_routed_experts
+    config.n_routed_experts = args.num_experts
     print0(f"OVERRIDE: n_routed_experts {old_e} → {args.num_experts}")
 
 if args.top_k > 0:
-    old_k = config.moe.num_experts_per_tok
-    config.moe.num_experts_per_tok = args.top_k
+    old_k = config.num_experts_per_tok
+    config.num_experts_per_tok = args.top_k
     print0(f"OVERRIDE: num_experts_per_tok {old_k} → {args.top_k}")
 
 if args.n_group > 0:
-    old_g = config.moe.n_group
-    config.moe.n_group = args.n_group
+    old_g = config.n_group
+    config.n_group = args.n_group
     print0(f"OVERRIDE: n_group {old_g} → {args.n_group}")
 
 if args.topk_group > 0:
-    old_tg = config.moe.topk_group
-    config.moe.topk_group = args.topk_group
+    old_tg = config.topk_group
+    config.topk_group = args.topk_group
     print0(f"OVERRIDE: topk_group {old_tg} → {args.topk_group}")
 
 if args.total_tokens > 0:
@@ -313,13 +329,20 @@ if not use_dummy_wandb:
     wandb_run.config.update(asdict(config), allow_val_change=True)
 
 # ─── Build model ───
+import time as _time
 print0("Building model on meta device...")
+_t0 = _time.time()
 with torch.device("meta"):
     model = NanoSeekModel(config)
+print0(f"  meta build: {_time.time()-_t0:.1f}s")
 
 # Move to device and initialize
+_t0 = _time.time()
 model.to_empty(device=device)
+print0(f"  to_empty: {_time.time()-_t0:.1f}s")
+_t0 = _time.time()
 model.init_weights()
+print0(f"  init_weights: {_time.time()-_t0:.1f}s")
 
 # ─── Parameter counts ───
 param_counts = model.num_parameters()
@@ -971,10 +994,12 @@ print0(f"Gradient accumulation: {target_grad_accum} steps "
         f"({args.device_batch_size}×{config.sequence_length}×{ddp_world_size} "
         f"= {world_tokens_per_fwdbwd:,} tokens/fwdbwd)")
 
+_t0 = _time.time()
 optimizer = setup_optimizer(
     model, config, args, batch_lr_scale,
     width_lr_scale, weight_decay_scaled, ddp
 )
+print0(f"  optimizer setup: {_time.time()-_t0:.1f}s")
 
 orig_model = model
 
@@ -1104,8 +1129,9 @@ else:
     print0("torch.compile registered (lazy — compiles on first forward pass)")
 
 # ─── EMA tracker ───
+_t0 = _time.time()
 ema_tracker = EMATracker(orig_model, decay=args.ema_decay)
-print0(f"EMA tracker initialized (decay={args.ema_decay}, update every {args.ema_every} steps)")
+print0(f"EMA tracker initialized (decay={args.ema_decay}, update every {args.ema_every} steps) [{_time.time()-_t0:.1f}s]")
 
 # ─── Checkpoint manager (atomic writes + disk cleanup) ───
 # Include run name in checkpoint dir so ablation runs don't overwrite each other.
@@ -1189,8 +1215,9 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
 )
 
 # ─── Kick off first batch ───
+_t0 = _time.time()
 x, y, dataloader_state_dict = next(train_loader)
-print0(f"First batch prefetched: {x.shape} inputs, {y.shape} targets")
+print0(f"First batch prefetched: {x.shape} inputs, {y.shape} targets [{_time.time()-_t0:.1f}s]")
 
 # ─── NaN tracking ───
 _nan_count = 0
@@ -1393,6 +1420,21 @@ while True:
     )
     current_batch_tokens = world_tokens_per_fwdbwd * current_accum
 
+    # ─── torch.profiler (--profile-steps) ───
+    _profiling_this_step = master_process and step in _profile_steps
+    if _profiling_this_step:
+        from torch.profiler import profile as _torch_profile, ProfilerActivity, record_function
+        _profile_dir = os.path.join("runs", args.run, "profiles")
+        os.makedirs(_profile_dir, exist_ok=True)
+        _profiler_ctx = _torch_profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+        )
+        _profiler_ctx.__enter__()
+        print0(f"  [PROFILER] Recording step {step}...")
+
     synchronize()
     t0 = time.time()
 
@@ -1439,10 +1481,19 @@ while True:
         mtp_loss_accum += outputs['mtp_loss'].detach()
         aux_loss_accum += outputs['aux_loss'].detach()
 
+        # Memory timeline: capture after forward on last micro-step (no extra sync)
+        _track_mem = args.profile_memory and device_type == "cuda" and micro_step == current_accum - 1
+        if _track_mem:
+            _mem_after_fwd = torch.cuda.memory_allocated(device) / 1e9
+
         # Scale loss for gradient accumulation
         # Each .backward() ADDS to .grad -> divide by accum count
         loss = loss / current_accum
         loss.backward()
+
+        # Memory timeline: capture after backward on last micro-step
+        if _track_mem:
+            _mem_after_bwd = torch.cuda.memory_allocated(device) / 1e9
 
         # Prefetch next batch while the GPU is busy with backward
         _t_data_start = time.time()
@@ -1463,7 +1514,11 @@ while True:
     # ─── Per-group gradient norms (before clipping) ───
     # Computed pre-clip so we see the true gradient landscape.
     # Gate grad norm divergence is an early warning for routing collapse.
-    per_group_gn = compute_per_group_grad_norms()
+    # Only computed on log steps — ~200 small CUDA kernels per call (T1.3 optimization).
+    if step % config.log_every_steps == 0:
+        per_group_gn = compute_per_group_grad_norms()
+    else:
+        per_group_gn = {}
 
     # ─── Gradient clipping (Difference #3) ───
     # MoE gradient variance is 8× higher than dense (κ=12.5%)
@@ -1492,6 +1547,25 @@ while True:
     # Step the optimizer
     optimizer.step()
     model.zero_grad(set_to_none=True)
+
+    # Memory timeline: capture after optimizer step
+    if args.profile_memory and device_type == "cuda":
+        _mem_after_optim = torch.cuda.memory_allocated(device) / 1e9
+        _mem_reserved = torch.cuda.memory_reserved(device) / 1e9
+        _mem_fragmentation = _mem_reserved - _mem_after_optim  # wasted reserved memory
+
+    # ─── Finish profiler (--profile-steps) ───
+    if _profiling_this_step:
+        _profiler_ctx.__exit__(None, None, None)
+        _trace_path = os.path.join(_profile_dir, f"step_{step}.json")
+        _profiler_ctx.export_chrome_trace(_trace_path)
+        # Print top 20 ops by GPU time for quick diagnosis
+        print0(f"\n  [PROFILER] Step {step} — Top 20 CUDA ops:")
+        print0(_profiler_ctx.key_averages().table(
+            sort_by="cuda_time_total", row_limit=20
+        ))
+        print0(f"  [PROFILER] Chrome trace saved: {_trace_path}")
+        print0(f"  [PROFILER] Open in chrome://tracing or ui.perfetto.dev\n")
 
     # ─── MoE load-balance bias update (Difference #6) ───
     # This is the aux-loss-free balancing mechanism from DeepSeek V3.
@@ -1604,6 +1678,13 @@ while True:
             # ─── Per-group LRs + memory ───
             **group_lrs,
             **mem_stats,
+            # ─── Memory timeline (--profile-memory) ───
+            **({"mem/after_fwd_gb": _mem_after_fwd,
+                "mem/after_bwd_gb": _mem_after_bwd,
+                "mem/after_optim_gb": _mem_after_optim,
+                "mem/reserved_gb": _mem_reserved,
+                "mem/fragmentation_gb": _mem_fragmentation,
+               } if args.profile_memory and device_type == "cuda" else {}),
         })
 
     step += 1

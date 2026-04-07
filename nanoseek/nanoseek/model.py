@@ -17,6 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
+from torch.profiler import record_function
 
 # Import configurations from config.py
 # Handle both package import and direct execution
@@ -712,6 +713,11 @@ class MoE(nn.Module):
             [Expert(hidden_dim, moe_inter_dim) for _ in range(n_routed_experts)]
         )
 
+        # NOTE: Do NOT cache weight tensor references here (e.g., [e.w_gate.weight ...]).
+        # When constructing on meta device + to_empty(), cached refs become stale
+        # (point to meta tensors while actual params moved to cuda).
+        # Access via self.routed_experts[i].w_gate.weight in forward instead.
+
         # Shared expert (dense, always active) — single MLP with combined inter_dim
         # DeepSeek V3 pattern: n_shared_experts is a multiplier, not a count of modules
         effective_shared_dim = shared_inter_dim or (n_shared_experts * moe_inter_dim)
@@ -728,9 +734,9 @@ class MoE(nn.Module):
         and use torch.bmm to process all experts in 2 fused kernel launches instead
         of 192 separate ones.
 
-        Gradient correctness: torch.stack is a differentiable op — gradients flow
-        through the stacked tensor back to each individual expert's parameters.
-        Padding with zeros is gradient-neutral (0 × dL/dout = 0).
+        Uses a single torch.stack over pre-built weight list to minimize Python
+        overhead. torch.stack is differentiable — gradients flow back to each
+        individual expert's parameters. Padding with zeros is gradient-neutral.
 
         Args:
             sorted_x:           [N*K, D] tokens sorted by expert assignment
@@ -745,35 +751,37 @@ class MoE(nn.Module):
         NK, D = sorted_x.shape
         dtype = sorted_x.dtype
 
-        max_count = expert_counts.max().item()
-        if max_count == 0:
+        if NK == 0:
             return torch.zeros_like(sorted_x)
 
-        # ── Vectorized pad: scatter tokens into [E, max_count, D] ──
-        # position_in_expert[i] = index of token i within its expert's batch
-        # Since sorted_indices is sorted, position = global_index - expert_start
+        # ── Static pad size: avoids .item() and torch.compile recompilation ──
+        # With dynamic=False, NK and E are compile-time constants, so pad_size
+        # is also constant → no recompilation. 4x average gives huge margin
+        # (Binomial(N, K/E) has std ≈ √(NK/E), so max < mean + 10·std ≈ 1.2× avg).
+        # 4x handles even degenerate early-training routing.
+        pad_size = (NK + E - 1) // E * 8
+
         position_in_expert = (
             torch.arange(NK, device=sorted_x.device) - expert_boundaries[sorted_indices]
         )
-        padded_input = sorted_x.new_zeros(E, max_count, D)
+        padded_input = sorted_x.new_zeros(E, pad_size, D)
         padded_input[sorted_indices, position_in_expert] = sorted_x
 
-        # ── Stack expert weights (torch.stack preserves autograd graph) ──
+        # ── Stack expert weights (inline access — no caching due to meta device) ──
         # CastLinear stores weight as [out_features, in_features]:
         #   w_gate.weight: [inter, D], w_up.weight: [inter, D], w_down.weight: [D, inter]
-        # Concatenate gate+up into one matmul: [E, 2*inter, D]
-        w_gate = torch.stack([e.w_gate.weight for e in self.routed_experts])  # [E, inter, D]
-        w_up = torch.stack([e.w_up.weight for e in self.routed_experts])      # [E, inter, D]
-        w_gate_up = torch.cat([w_gate, w_up], dim=1).to(dtype)               # [E, 2*inter, D]
+        # Fuse gate+up into [E, 2*inter, D] via one torch.cat after two stacks
+        w_gate_up = torch.cat([
+            torch.stack([e.w_gate.weight for e in self.routed_experts]),  # [E, inter, D]
+            torch.stack([e.w_up.weight for e in self.routed_experts]),    # [E, inter, D]
+        ], dim=1).to(dtype)                                              # [E, 2*inter, D]
         w_down = torch.stack([e.w_down.weight for e in self.routed_experts]).to(dtype)  # [E, D, inter]
 
         # ── Batched SwiGLU: 2 bmm calls instead of 192 individual matmuls ──
-        # F.linear(x, W) computes x @ W.T, so bmm equivalent is:
-        #   padded_input @ w_gate_up.transpose(1,2)
-        gate_up_out = torch.bmm(padded_input, w_gate_up.transpose(1, 2))  # [E, max_count, 2*inter]
-        gate_out, up_out = gate_up_out.chunk(2, dim=-1)                   # each [E, max_count, inter]
-        hidden = F.silu(gate_out) * up_out                                # [E, max_count, inter]
-        out = torch.bmm(hidden, w_down.transpose(1, 2))                   # [E, max_count, D]
+        gate_up_out = torch.bmm(padded_input, w_gate_up.transpose(1, 2))  # [E, pad_size, 2*inter]
+        gate_out, up_out = gate_up_out.chunk(2, dim=-1)                   # each [E, pad_size, inter]
+        hidden = F.silu(gate_out) * up_out                                # [E, pad_size, inter]
+        out = torch.bmm(hidden, w_down.transpose(1, 2))                   # [E, pad_size, D]
 
         # ── Vectorized unpad: gather valid outputs back to [N*K, D] ──
         sorted_output = out[sorted_indices, position_in_expert]
@@ -795,82 +803,79 @@ class MoE(nn.Module):
         x = hidden_states.view(-1, hidden_dim)  # [N, D] where N = B*S
 
         # Route tokens
-        weights, indices, aux_loss, metadata = self.gate(x)
+        with record_function("MoE::gate"):
+            weights, indices, aux_loss, metadata = self.gate(x)
         # weights: [N, K], indices: [N, K]
 
         # Scatter-based expert dispatch: sort tokens by expert for coalesced access
         # Instead of iterating all E experts with boolean masks (O(E*N)),
         # we flatten token-expert assignments, sort by expert, and process
         # contiguous slices. ~10-50x faster for E=64.
-        N, D = x.shape
-        K = self.num_experts_per_tok
-        E = self.n_routed_experts
+        with record_function("MoE::dispatch"):
+            N, D = x.shape
+            K = self.num_experts_per_tok
+            E = self.n_routed_experts
 
-        # Flatten [N, K] → [N*K] and expand inputs to match
-        flat_indices = indices.view(-1)           # [N*K]
-        flat_weights = weights.view(-1)           # [N*K]
-        x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(N * K, D)  # [N*K, D]
+            # Flatten [N, K] → [N*K] and expand inputs to match
+            flat_indices = indices.view(-1)           # [N*K]
+            flat_weights = weights.view(-1)           # [N*K]
+            x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(N * K, D)  # [N*K, D]
 
-        # Sort by expert index for contiguous memory access
-        sort_order = flat_indices.argsort(stable=True)
-        sorted_indices = flat_indices[sort_order]
-        sorted_x = x_expanded[sort_order]         # [N*K, D]
-        sorted_weights = flat_weights[sort_order]  # [N*K]
+            # Sort by expert index for contiguous memory access
+            sort_order = flat_indices.argsort(stable=True)
+            sorted_indices = flat_indices[sort_order]
+            sorted_x = x_expanded[sort_order]         # [N*K, D]
+            sorted_weights = flat_weights[sort_order]  # [N*K]
 
-        # Find boundaries: expert_boundaries[e] = start index, expert_boundaries[e+1] = end
-        expert_counts = torch.bincount(sorted_indices, minlength=E)  # [E]
-        expert_boundaries = torch.zeros(E + 1, dtype=torch.long, device=x.device)
-        expert_boundaries[1:] = expert_counts.cumsum(0)
+            # Find boundaries: expert_boundaries[e] = start index, expert_boundaries[e+1] = end
+            expert_counts = torch.bincount(sorted_indices, minlength=E)  # [E]
+            expert_boundaries = torch.zeros(E + 1, dtype=torch.long, device=x.device)
+            expert_boundaries[1:] = expert_counts.cumsum(0)
 
         # ── Expert dispatch: batched (GPU) or sequential (CPU) ──
         # Batched dispatch uses torch.bmm to process all experts in 2 kernel launches
-        # instead of 192 (64 experts × 3 matmuls). Worth it on GPU where kernel launch
-        # overhead (~7µs × 192 = 1.3ms) dominates at small-to-medium scale.
-        # Guard: skip batched if load imbalance causes >50% padding waste.
-        avg_count = (N * K) / E
-        max_count = expert_counts.max().item()  # single GPU→CPU sync
-        waste_ratio = max_count / max(avg_count, 1)
+        # instead of 192 (64 experts × 3 matmuls). Always use batched on GPU —
+        # the static pad_size (4x average) avoids .item() and torch.compile
+        # recompilation while keeping padding overhead manageable.
+        use_batched = sorted_x.is_cuda and E >= 8
 
-        use_batched = (
-            sorted_x.is_cuda
-            and E >= 8
-            and waste_ratio < 1.5  # skip if >50% padding waste (skewed routing)
-        )
+        with record_function("MoE::expert_compute"):
+            if use_batched:
+                sorted_output = self._batched_expert_forward(
+                    sorted_x, sorted_indices, expert_counts, expert_boundaries,
+                )
+            else:
+                # Sequential fallback: process each expert's contiguous batch
+                # Used on CPU (testing), or when routing is too skewed for batching.
+                sorted_output = torch.zeros_like(sorted_x)  # [N*K, D]
+                counts_cpu = expert_counts.tolist()
+                offset = 0
+                for expert_idx in range(E):
+                    cnt = counts_cpu[expert_idx]
+                    if cnt == 0:
+                        continue
+                    expert_input = sorted_x[offset:offset + cnt]
+                    sorted_output[offset:offset + cnt] = self.routed_experts[expert_idx](expert_input)
+                    offset += cnt
 
-        if use_batched:
-            sorted_output = self._batched_expert_forward(
-                sorted_x, sorted_indices, expert_counts, expert_boundaries,
-            )
-        else:
-            # Sequential fallback: process each expert's contiguous batch
-            # Used on CPU (testing), or when routing is too skewed for batching.
-            sorted_output = torch.zeros_like(sorted_x)  # [N*K, D]
-            counts_cpu = expert_counts.tolist()
-            offset = 0
-            for expert_idx in range(E):
-                cnt = counts_cpu[expert_idx]
-                if cnt == 0:
-                    continue
-                expert_input = sorted_x[offset:offset + cnt]
-                sorted_output[offset:offset + cnt] = self.routed_experts[expert_idx](expert_input)
-                offset += cnt
+        with record_function("MoE::combine"):
+            # Apply weights and scatter back to original token order
+            sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
 
-        # Apply weights and scatter back to original token order
-        sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
+            # Unsort and reduce: accumulate weighted outputs back to [N, D]
+            # Create mapping from sorted position → original token index
+            orig_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, K).reshape(N * K)
+            orig_token_idx = orig_token_idx[sort_order]  # [N*K] — which token each sorted entry belongs to
 
-        # Unsort and reduce: accumulate weighted outputs back to [N, D]
-        # Create mapping from sorted position → original token index
-        orig_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, K).reshape(N * K)
-        orig_token_idx = orig_token_idx[sort_order]  # [N*K] — which token each sorted entry belongs to
-
-        routed_output = torch.zeros_like(x)  # [N, D]
-        routed_output.scatter_add_(0, orig_token_idx.unsqueeze(-1).expand_as(sorted_output), sorted_output)
+            routed_output = torch.zeros_like(x)  # [N, D]
+            routed_output.scatter_add_(0, orig_token_idx.unsqueeze(-1).expand_as(sorted_output), sorted_output)
 
         # Shared expert — processes ALL tokens (unless ablation-disabled)
         if self.disable_shared_experts:
             output = routed_output  # [N, D]
         else:
-            shared_output = self.shared_expert(x)  # [N, D]
+            with record_function("MoE::shared_expert"):
+                shared_output = self.shared_expert(x)  # [N, D]
             output = routed_output + shared_output  # [N, D]
         output = output.view(*orig_shape)  # [B, S, D]
 
@@ -1263,6 +1268,7 @@ class NanoSeekDecoderLayer(nn.Module):
         n_group: int = 4,
         topk_group: int = 2,
         disable_shared_experts: bool = False,
+        seq_aux_loss_alpha: float = 0.0001,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1306,6 +1312,7 @@ class NanoSeekDecoderLayer(nn.Module):
                 routed_scaling_factor=routed_scaling_factor,
                 shared_inter_dim=shared_inter_dim,
                 disable_shared_experts=disable_shared_experts,
+                seq_aux_loss_alpha=seq_aux_loss_alpha,
             )
         else:
             self.ffn = Expert(hidden_size, intermediate_size)
@@ -1333,31 +1340,33 @@ class NanoSeekDecoderLayer(nn.Module):
             present_key_value: Updated KV cache (None if use_cache=False)
             aux_data: Dict with MoE routing metrics (empty for dense layers)
         """
-        # ---- Attention block (pre-norm + residual) ----
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_output, present_key_value = self.self_attn(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-        )
-        hidden_states = residual + attn_output
+        with record_function(f"Layer_{self.layer_idx}"):
+            # ---- Attention block (pre-norm + residual) ----
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            with record_function("MLA"):
+                attn_output, present_key_value = self.self_attn(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    use_cache=use_cache,
+                )
+            hidden_states = residual + attn_output
 
-        # ---- FFN block (pre-norm + residual) ----
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+            # ---- FFN block (pre-norm + residual) ----
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
-        if self.use_moe:
-            # MoE returns (output, aux_data_dict)
-            ffn_output, aux_data = self.ffn(hidden_states)
-        else:
-            # Dense FFN returns just the output tensor
-            ffn_output = self.ffn(hidden_states)
-            aux_data = {}
+            if self.use_moe:
+                with record_function("MoE"):
+                    ffn_output, aux_data = self.ffn(hidden_states)
+            else:
+                with record_function("DenseFFN"):
+                    ffn_output = self.ffn(hidden_states)
+                    aux_data = {}
 
-        hidden_states = residual + ffn_output
+            hidden_states = residual + ffn_output
 
         return hidden_states, present_key_value, aux_data
 
@@ -1430,6 +1439,7 @@ class NanoSeekModel(nn.Module):
                 n_group=config.moe.n_group,
                 topk_group=config.moe.topk_group,
                 disable_shared_experts=config.moe.disable_shared_experts,
+                seq_aux_loss_alpha=config.moe.seq_aux_loss_alpha,
             ))
 
         # ---- Final norm + LM head ----
@@ -1503,26 +1513,22 @@ class NanoSeekModel(nn.Module):
         This method recomputes any buffers that require non-trivial initialization.
         """
         config = self.config
+        # Compute RoPE frequencies ONCE and share across all layers
+        rope_freqs = precompute_freqs_cis(
+            config.mla.qk_rope_head_dim,
+            config.max_position_embeddings,
+            config.mla.rope_theta,
+            config.mla.rope_scaling_factor,
+            config.mla.original_max_position_embeddings,
+        )
         for layer in self.layers:
             attn = layer.self_attn
-            attn.freqs_cis = precompute_freqs_cis(
-                config.mla.qk_rope_head_dim,
-                config.max_position_embeddings,
-                config.mla.rope_theta,
-                config.mla.rope_scaling_factor,
-                config.mla.original_max_position_embeddings,
-            ).to(device=attn.freqs_cis.device)
+            attn.freqs_cis = rope_freqs.to(device=attn.freqs_cis.device)
         # MTP also has its own MLA with freqs_cis
         if self.mtp is not None:
             for mtp_mod in self.mtp.mtp_modules:
                 mtp_attn = mtp_mod.transformer.attn
-                mtp_attn.freqs_cis = precompute_freqs_cis(
-                    config.mla.qk_rope_head_dim,
-                    config.max_position_embeddings,
-                    config.mla.rope_theta,
-                    config.mla.rope_scaling_factor,
-                    config.mla.original_max_position_embeddings,
-                ).to(device=mtp_attn.freqs_cis.device)
+                mtp_attn.freqs_cis = rope_freqs.to(device=mtp_attn.freqs_cis.device)
 
     def _init_weights(self) -> None:
         """Width-dependent weight initialization with zero-init output projections.
