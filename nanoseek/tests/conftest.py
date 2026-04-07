@@ -14,14 +14,7 @@ from pathlib import Path
 # Add nanoseek/nanoseek/ to path so we can import config, model directly
 sys.path.insert(0, str(Path(__file__).parent.parent / "nanoseek"))
 
-from config import (
-    NanoSeekConfig,
-    MLAConfig,
-    MoEConfig,
-    MTPConfig,
-    SparseAttentionConfig,
-    get_nanoseek_config,
-)
+from config import NanoSeekConfig, get_config
 from model import (
     NanoSeekModel,
     MultiHeadLatentAttention,
@@ -65,48 +58,45 @@ def device():
 @pytest.fixture
 def config_1b():
     """NanoSeek-1B configuration - main config (1.08B active / 4.75B total)."""
-    return get_nanoseek_config()
+    return get_config("1b")
 
 
 @pytest.fixture
 def minimal_config():
-    """Minimal configuration for ultra-fast unit tests."""
-    return NanoSeekConfig(
-        hidden_size=256,
-        num_layers=2,
-        num_heads=4,
-        intermediate_size=512,
-        vocab_size=1000,
-        max_position_embeddings=128,
-        mla=MLAConfig(
-            q_lora_rank=55,
-            kv_lora_rank=18,
-            qk_nope_head_dim=48,
-            qk_rope_head_dim=16,
-            v_head_dim=48,
-        ),
-        moe=MoEConfig(
+    """Minimal configuration for ultra-fast unit tests.
+
+    Uses non-standard dims (256 hidden, head_dim=64) for speed.
+    The warning about non-standard head_dim is expected.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return NanoSeekConfig(
+            hidden_size=256,
+            num_layers=2,
+            num_heads=4,          # 256/4 = 64 head_dim (non-standard, OK for tests)
+            intermediate_size=512,
+            vocab_size=1000,
+            max_position_embeddings=128,
+            total_tokens=1_000_000,
+            global_batch_size=4,
+            sequence_length=64,
+            # MLA overrides for small test
+            _qk_nope_head_dim=48,
+            _qk_rope_head_dim=16,
+            _v_head_dim=48,
+            _q_lora_rank_override=55,
+            _kv_lora_rank_override=18,
+            # MoE overrides for small test
             n_routed_experts=8,
             num_experts_per_tok=2,
             n_shared_experts=1,
-            moe_intermediate_size=128,
+            _moe_intermediate_size_override=128,
             n_group=2,
             topk_group=1,
             first_k_dense_replace=1,
-        ),
-        mtp=MTPConfig(
             num_mtp_modules=1,
-            mtp_num_heads=2,
-        ),
-        sparse=SparseAttentionConfig(
-            enabled=False,
-            topk_tokens=64,
-            activation_threshold=32,
-        ),
-        total_tokens=1_000_000,
-        global_batch_size=4,
-        sequence_length=64,
-    )
+        )
 
 
 # =============================================================================

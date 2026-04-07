@@ -18,6 +18,8 @@ dev = [
 training = [
     "wandb>=0.15.0",
     "tensorboard>=2.12.0",
+    "scikit-learn>=1.0.0",
+    "pyarrow>=10.0.0",
 ]
 
 [tool.pytest.ini_options]

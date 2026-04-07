@@ -466,17 +466,17 @@ def test_engine():
     Uses the muP anchor config (~314M params, the smallest real config).
     """
     try:
-        from .config import get_nanoseek_anchor_config
+        from .config import get_config
         from .model import create_nanoseek
     except ImportError:
-        from config import get_nanoseek_anchor_config
+        from config import get_config
         from model import create_nanoseek
 
     print("=" * 60)
     print("NanoSeek Engine — Smoke Test (anchor config)")
     print("=" * 60)
 
-    config = get_nanoseek_anchor_config()
+    config = get_config("anchor")
     model = create_nanoseek(config)
     model.eval()
 

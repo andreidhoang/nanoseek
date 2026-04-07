@@ -3,7 +3,6 @@
 # - MLA (Multi-head Latent Attention): ~23x KV cache compression
 # - MoE (Mixture of Experts): 5x parameter capacity with sparse activation
 # - MTP (Multi-Token Prediction): 1.4x inference speedup via speculative decoding
-# - DSA (DeepSeek Sparse Attention): O(L²) → O(Lk) complexity reduction
 # - YaRN RoPE: Extended context length support
 #
 # Reference: DeepSeek-V3 Technical Report (2024)
@@ -19,50 +18,13 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
-# ─── NVTX Profiling ──────────────────────────────────────────────────────────
-# Module-level toggle. Zero cost when disabled (function calls are no-ops).
-# Enable from training script: `import nanoseek.nanoseek.model as M; M.enable_nvtx()`
-# Then run: `nsys profile -t cuda,nvtx ...` or `ncu --nvtx --nvtx-include "moe/" ...`
-_nvtx_enabled = False
-try:
-    import torch.cuda.nvtx as _nvtx
-except ImportError:
-    _nvtx = None
-
-def enable_nvtx():
-    """Enable NVTX markers in model forward passes."""
-    global _nvtx_enabled
-    _nvtx_enabled = True
-
-def disable_nvtx():
-    """Disable NVTX markers."""
-    global _nvtx_enabled
-    _nvtx_enabled = False
-
-def _nvtx_push(name: str):
-    if _nvtx_enabled and _nvtx is not None:
-        _nvtx.range_push(name)
-
-def _nvtx_pop():
-    if _nvtx_enabled and _nvtx is not None:
-        _nvtx.range_pop()
-
 # Import configurations from config.py
 # Handle both package import and direct execution
 try:
-    from .config import (
-        NanoSeekConfig,
-        YaRNConfig,
-        SparseAttentionConfig,
-        get_nanoseek_config,
-    )
+    from .config import NanoSeekConfig, get_config
 except ImportError:
-    from config import (
-        NanoSeekConfig,
-        YaRNConfig,
-        SparseAttentionConfig,
-        get_nanoseek_config,
-    )
+    from config import NanoSeekConfig, get_config
+
 
 # =============================================================================
 # SECTION 1.5: CASTLINEAR (DTYPE-CASTING LINEAR)
@@ -215,23 +177,23 @@ class MultiHeadLatentAttention(nn.Module):
 
     Two operating modes:
     1. TRAINING MODE: Standard forward with explicit K/V expansion via W_KVB.
-       Supports FlashAttention/SDPA for fused attention kernels.
+        Supports FlashAttention/SDPA for fused attention kernels.
 
     2. INFERENCE MODE (weight absorption): Absorbs W_UK into Q projection and
-       W_UV into output projection, so attention operates directly on the
-       compressed latent c_kv without ever materializing full-rank K/V.
-       This is the key inference optimization from DeepSeek-V2 Section 3.2.2.
+        W_UV into output projection, so attention operates directly on the
+        compressed latent c_kv without ever materializing full-rank K/V.
+        This is the key inference optimization from DeepSeek-V2 Section 3.2.2.
 
     Weight absorption math:
-       Standard: attn = softmax(Q_nope @ K_nope^T + Q_pe @ K_pe^T) @ V
-       Where:    K_nope = c_kv @ W_UK,  V = c_kv @ W_UV
+        Standard: attn = softmax(Q_nope @ K_nope^T + Q_pe @ K_pe^T) @ V
+        Where:    K_nope = c_kv @ W_UK,  V = c_kv @ W_UV
 
-       Absorbed: attn = softmax(Q'_nope @ c_kv^T + Q_pe @ K_pe^T) @ c_kv
-       Where:    Q'_nope = Q_nope @ W_UK^T  (absorbed into query)
-       Then:     output  = attn @ c_kv @ W_UV @ W_O  (absorbed into output)
+        Absorbed: attn = softmax(Q'_nope @ c_kv^T + Q_pe @ K_pe^T) @ c_kv
+        Where:    Q'_nope = Q_nope @ W_UK^T  (absorbed into query)
+        Then:     output  = attn @ c_kv @ W_UV @ W_O  (absorbed into output)
 
-       This means during inference we never expand c_kv to full K/V,
-       and the KV cache stores only (c_kv, k_pe) — both low-dimensional.
+        This means during inference we never expand c_kv to full K/V,
+        and the KV cache stores only (c_kv, k_pe) — both low-dimensional.
     """
 
     def __init__(
@@ -292,7 +254,7 @@ class MultiHeadLatentAttention(nn.Module):
         # Output projection
         self.wo = CastLinear(num_heads * v_head_dim, hidden_size, bias=False)
 
-        # =====================================================================
+        # === no==================================================================
         # Absorption mode flag (matches DeepSeek's attn_impl: "naive"|"absorb")
         # "absorb" = inference path: W_UK absorbed into Q, attention on c_kv directly
         # "naive"  = training path: explicit K/V expansion via wkv_b
@@ -344,7 +306,7 @@ class MultiHeadLatentAttention(nn.Module):
         Two modes controlled by self.absorb (like DeepSeek's attn_impl="naive"|"absorb"):
         - absorb=False (training): Expand c_kv via wkv_b to full K/V, standard attention.
         - absorb=True  (inference): Absorb W_UK into Q, attention on c_kv directly.
-          No pre-extraction needed — wkv_b.weight is reshaped via zero-copy .view() each call.
+            No pre-extraction needed — wkv_b.weight is reshaped via zero-copy .view() each call.
 
         Weight absorption math (absorb=True):
             score = (Q_nope @ W_UK) @ c_kv^T + Q_pe @ K_pe^T
@@ -352,9 +314,9 @@ class MultiHeadLatentAttention(nn.Module):
 
         Why NOT pre-fuse W_UK into W_Q or W_UV into W_O (from DeepSeek GitHub #848):
         1. FP8: wkv_b is stored in FP8, dequantized on-the-fly. Pre-fusing creates
-           huge matrices (q_lora_rank × kv_lora_rank × n_heads) harder to quantize.
+            huge matrices (q_lora_rank × kv_lora_rank × n_heads) harder to quantize.
         2. Tensor parallelism: wkv_b is ColumnParallelLinear, already head-sharded.
-           Pre-fusing would require cross-GPU communication.
+            Pre-fusing would require cross-GPU communication.
         3. Memory: separate einsum reuses wkv_b for both K-absorption and V-absorption.
 
         KV Cache format: (c_kv, k_pe_rotated)
@@ -377,23 +339,17 @@ class MultiHeadLatentAttention(nn.Module):
         # =================================================================
         # QUERY PATH (shared between both modes)
         # =================================================================
-        _nvtx_push("mla/q_path")
         q = self.wq_b(self.q_norm(self.wq_a(hidden_states)))  # [B, S, n_heads * qk_head_dim]
         q = q.view(batch_size, seq_len, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        _nvtx_pop()  # mla/q_path
-
         # =================================================================
         # KV PATH (shared between both modes)
         # =================================================================
-        _nvtx_push("mla/kv_path")
         kv = self.wkv_a(hidden_states)  # [B, S, kv_lora_rank + qk_rope_head_dim]
         c_kv, k_pe_raw = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         c_kv = self.kv_norm(c_kv) 
         k_pe_raw = k_pe_raw.unsqueeze(2)  # [B, S, 1, rope_dim]
-
-        _nvtx_pop()  # mla/kv_path
 
         # =================================================================
         # ROPE + CACHE (shared between both modes)
@@ -478,6 +434,7 @@ class MultiHeadLatentAttention(nn.Module):
             # NAIVE MODE (training path — explicit K/V expansion via wkv_b)
             # Supports SDPA / FlashAttention for fused kernels.
             # =============================================================
+            # wkv_b decompression + attention kernel + mask construction
             kv_expanded = self.wkv_b(c_kv)  # [B, kv_len, n_heads * (qk_nope + v)]
             kv_expanded = kv_expanded.view(
                 batch_size, kv_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -495,8 +452,9 @@ class MultiHeadLatentAttention(nn.Module):
             v = v.transpose(1, 2)
 
             # Use SDPA when available (FlashAttention / memory-efficient kernels)
-            _nvtx_push("mla/sdpa")
-            use_sdpa = hasattr(F, "scaled_dot_product_attention")
+            # MPS SDPA bug: returns output with Q's head_dim instead of V's when they differ.
+            # MLA has qk_dim=192 (128+64) vs v_dim=128, so we must skip SDPA on MPS.
+            use_sdpa = hasattr(F, "scaled_dot_product_attention") and q.device.type != "mps"
 
             # PERF: Use is_causal=True instead of building an explicit mask tensor.
             # This lets SDPA/FlashAttention use its built-in causal masking kernel
@@ -529,14 +487,10 @@ class MultiHeadLatentAttention(nn.Module):
                     attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=True)
                 attn_output = torch.matmul(attn_weights, v)
 
-            _nvtx_pop()  # mla/sdpa
-
             # Output projection
-            _nvtx_push("mla/o_proj")
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.v_head_dim)
             output = self.wo(attn_output)
-            _nvtx_pop()  # mla/o_proj
 
         return output, present_key_value
 
@@ -816,16 +770,10 @@ class MoE(nn.Module):
         # ── Batched SwiGLU: 2 bmm calls instead of 192 individual matmuls ──
         # F.linear(x, W) computes x @ W.T, so bmm equivalent is:
         #   padded_input @ w_gate_up.transpose(1,2)
-        _nvtx_push("moe/bmm_gate_up")
         gate_up_out = torch.bmm(padded_input, w_gate_up.transpose(1, 2))  # [E, max_count, 2*inter]
-        _nvtx_pop()
-        _nvtx_push("moe/swiglu")
         gate_out, up_out = gate_up_out.chunk(2, dim=-1)                   # each [E, max_count, inter]
         hidden = F.silu(gate_out) * up_out                                # [E, max_count, inter]
-        _nvtx_pop()
-        _nvtx_push("moe/bmm_down")
         out = torch.bmm(hidden, w_down.transpose(1, 2))                   # [E, max_count, D]
-        _nvtx_pop()
 
         # ── Vectorized unpad: gather valid outputs back to [N*K, D] ──
         sorted_output = out[sorted_indices, position_in_expert]
@@ -847,9 +795,7 @@ class MoE(nn.Module):
         x = hidden_states.view(-1, hidden_dim)  # [N, D] where N = B*S
 
         # Route tokens
-        _nvtx_push("moe/gate")
         weights, indices, aux_loss, metadata = self.gate(x)
-        _nvtx_pop()  # moe/gate
         # weights: [N, K], indices: [N, K]
 
         # Scatter-based expert dispatch: sort tokens by expert for coalesced access
@@ -861,7 +807,6 @@ class MoE(nn.Module):
         E = self.n_routed_experts
 
         # Flatten [N, K] → [N*K] and expand inputs to match
-        _nvtx_push("moe/dispatch")
         flat_indices = indices.view(-1)           # [N*K]
         flat_weights = weights.view(-1)           # [N*K]
         x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(N * K, D)  # [N*K, D]
@@ -876,8 +821,6 @@ class MoE(nn.Module):
         expert_counts = torch.bincount(sorted_indices, minlength=E)  # [E]
         expert_boundaries = torch.zeros(E + 1, dtype=torch.long, device=x.device)
         expert_boundaries[1:] = expert_counts.cumsum(0)
-
-        _nvtx_pop()  # moe/dispatch
 
         # ── Expert dispatch: batched (GPU) or sequential (CPU) ──
         # Batched dispatch uses torch.bmm to process all experts in 2 kernel launches
@@ -894,7 +837,6 @@ class MoE(nn.Module):
             and waste_ratio < 1.5  # skip if >50% padding waste (skewed routing)
         )
 
-        _nvtx_push("moe/expert_compute")
         if use_batched:
             sorted_output = self._batched_expert_forward(
                 sorted_x, sorted_indices, expert_counts, expert_boundaries,
@@ -912,10 +854,8 @@ class MoE(nn.Module):
                 expert_input = sorted_x[offset:offset + cnt]
                 sorted_output[offset:offset + cnt] = self.routed_experts[expert_idx](expert_input)
                 offset += cnt
-        _nvtx_pop()  # moe/expert_compute
 
         # Apply weights and scatter back to original token order
-        _nvtx_push("moe/combine")
         sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
 
         # Unsort and reduce: accumulate weighted outputs back to [N, D]
@@ -925,7 +865,6 @@ class MoE(nn.Module):
 
         routed_output = torch.zeros_like(x)  # [N, D]
         routed_output.scatter_add_(0, orig_token_idx.unsqueeze(-1).expand_as(sorted_output), sorted_output)
-        _nvtx_pop()  # moe/combine
 
         # Shared expert — processes ALL tokens (unless ablation-disabled)
         if self.disable_shared_experts:
@@ -1275,7 +1214,7 @@ class MultiTokenPrediction(nn.Module):
 # DECODER LAYER
 # =============================================================================
 # Standard pre-norm transformer decoder layer following DeepSeek V3 architecture.
-# Wires together: RMSNorm + MLA (or DSA) + dense FFN (Expert) or MoE.
+# Wires together: RMSNorm + MLA + dense FFN (Expert) or MoE.
 
 class NanoSeekDecoderLayer(nn.Module):
     """Single decoder layer: pre-norm attention + pre-norm FFN with residual connections.
@@ -1284,8 +1223,7 @@ class NanoSeekDecoderLayer(nn.Module):
         x → input_layernorm → self_attn → + residual
         → post_attention_layernorm → ffn → + residual → output
 
-    The attention module is MLA (Multi-head Latent Attention). DSA (DeepSeek Sparse
-    Attention) support will be added when Section 9 is implemented.
+    The attention module is MLA (Multi-head Latent Attention).
 
     The FFN module is either:
         - Dense SwiGLU (Expert class) for early layers (layer_idx < first_k_dense_replace)
@@ -1333,7 +1271,7 @@ class NanoSeekDecoderLayer(nn.Module):
         # Pre-attention norm
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        # Attention — MLA for now, DSA added later (Section 9)
+        # Attention — MLA (Multi-head Latent Attention)
         self.self_attn = MultiHeadLatentAttention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -1460,6 +1398,7 @@ class NanoSeekModel(nn.Module):
         self.layers = nn.ModuleList()
         for i in range(config.num_layers):
             use_moe = (i >= config.moe.first_k_dense_replace)
+
             self.layers.append(NanoSeekDecoderLayer(
                 layer_idx=i,
                 hidden_size=config.hidden_size,
@@ -1679,9 +1618,7 @@ class NanoSeekModel(nn.Module):
         # would collapse embedding scale to unit norm regardless of width,
         # breaking muP's assumption that embedding output scale = O(1) naturally.
         # Embedding init std = 1/√hidden_size already controls the scale.
-        _nvtx_push("embedding")
         hidden_states = self.embed_tokens(input_ids)  # [B, S, H]
-        _nvtx_pop()
 
         # 2. Position IDs — only auto-compute for cached generation.
         # When past_key_values is None, leave position_ids=None so MLA's
@@ -1702,7 +1639,6 @@ class NanoSeekModel(nn.Module):
         self._layer_aux_data = {}  # Reset for this forward pass
 
         for i, layer in enumerate(self.layers):
-            _nvtx_push(f"layer/{i}")
             past_kv = past_key_values[i] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training and i in self._checkpoint_layer_ids:
@@ -1725,8 +1661,6 @@ class NanoSeekModel(nn.Module):
                     use_cache=use_cache,
                 )
 
-            _nvtx_pop()  # layer/i
-
             if use_cache and present_key_values is not None:
                 present_key_values.append(present_kv)
 
@@ -1737,12 +1671,9 @@ class NanoSeekModel(nn.Module):
                 self._layer_aux_data[i] = aux_data
 
         # 4. Final norm
-        _nvtx_push("final_norm")
         hidden_states = self.norm(hidden_states)  # [B, S, H]
-        _nvtx_pop()
 
         # 5. LM head + logit softcap
-        _nvtx_push("lm_head")
         logits = self.lm_head(hidden_states)  # [B, S, padded_V]
         logits = logits[..., :self.config.vocab_size]  # Slice off padding rows
         if self.logit_softcap > 0.0:
@@ -1751,8 +1682,6 @@ class NanoSeekModel(nn.Module):
             logits = logits.float()
             logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             logits = logits.to(hidden_states.dtype)
-
-        _nvtx_pop()  # lm_head
 
         # 6. Loss computation
         loss = None
@@ -1899,6 +1828,24 @@ class NanoSeekModel(nn.Module):
         active = total - inactive_params
         return {"active": active, "total": total}
 
+    def num_scaling_params(self) -> Dict[str, int]:
+        """Parameter breakdown for scaling law analysis.
+
+        Kaplan convention: scaling = active - embed.
+        Embed is a lookup (O(1) per token), not a matmul, so it doesn't
+        contribute to the compute-capacity relationship L(N, D).
+        """
+        counts = self.num_parameters()
+        n_embed = self.embed_tokens.weight.numel()
+        n_lm_head = self.lm_head.weight.numel()
+        return {
+            "embed": n_embed,
+            "lm_head": n_lm_head,
+            "active": counts["active"],
+            "total": counts["total"],
+            "scaling": counts["active"] - n_embed,
+        }
+
     def get_expert_load_stats(self) -> Dict[str, Tensor]:
         """Aggregate expert load statistics across all MoE layers.
 
@@ -1907,6 +1854,19 @@ class NanoSeekModel(nn.Module):
             load_per_expert: [E] mean token counts per expert
             per_layer: dict of {layer_idx: {"load_counts": Tensor, "H_load": Tensor}}
         """
+        if not self._layer_aux_data:
+            # No forward pass has run yet — return zeros with warning
+            import logging
+            logging.getLogger(__name__).warning(
+                "get_expert_load_stats() called before any forward pass — returning zeros"
+            )
+            n_experts = self.config.moe.n_routed_experts
+            return {
+                "entropy": torch.tensor(0.0),
+                "load_per_expert": torch.zeros(n_experts),
+                "per_layer": {},
+            }
+
         all_H = []
         all_counts = []
         per_layer = {}
@@ -2099,7 +2059,7 @@ def create_nanoseek(config: Optional[NanoSeekConfig] = None) -> NanoSeekModel:
         Initialized NanoSeekModel
     """
     if config is None:
-        config = get_nanoseek_config()
+        config = get_config("1b")
     return NanoSeekModel(config)
 
 
@@ -2120,7 +2080,7 @@ def test_nanoseek() -> None:
     print("NanoSeek Model — Comprehensive Smoke Test")
     print("=" * 60)
 
-    config = get_nanoseek_config()
+    config = get_config("1b")
     model = create_nanoseek(config)
 
     B, S, V = 2, 64, config.vocab_size
@@ -2210,16 +2170,6 @@ def test_nanoseek() -> None:
     print("=" * 60)
     print("ALL 8 TESTS PASSED")
     print("=" * 60)
-
-
-# =============================================================================
-# SECTION 8: LIGHTNING INDEXER (Phase 2)
-# =============================================================================
-
-
-# =============================================================================
-# SECTION 9: DEEPSEEK SPARSE ATTENTION (Phase 2)
-# =============================================================================
 
 
 if __name__ == "__main__":

@@ -47,9 +47,7 @@ from tqdm import tqdm
 # NanoSeek imports
 from nanoseek.nanoseek.config import (
     NanoSeekConfig,
-    get_nanoseek_config,
-    get_nanoseek_ablation_config,
-    get_nanoseek_anchor_config,  # kept for backwards compat
+    get_config,
 )
 from nanoseek.nanoseek.model import NanoSeekModel
 from nanoseek.nanoseek.common import (
@@ -79,14 +77,10 @@ def load_nanoseek_model(
     use_ema: bool = False,
 ) -> Tuple[NanoSeekModel, NanoSeekConfig, Any, Optional[Dict]]:
     """Load a NanoSeek model with optional EMA weights."""
-    config_map = {
-        "ablation": get_nanoseek_ablation_config,
-        "1b": get_nanoseek_config,
-    }
-    if scale not in config_map:
+    if scale not in ("ablation", "1b"):
         raise ValueError(f"Unknown scale: {scale}")
-    
-    config = config_map[scale]()
+
+    config = get_config(scale)
     print0(f"Loading NanoSeek-{scale} config:")
     print0(f"  Hidden size: {config.hidden_size}")
     print0(f"  Layers: {config.num_layers}")

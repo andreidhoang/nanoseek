@@ -10,12 +10,70 @@ Reference: Llama 3 (Dubey et al., 2024) — per-domain loss tracking
 
 import math
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+def load_domain_eval_data(
+    data_dir: str,
+    max_samples_per_domain: int = 100,
+) -> dict[str, list[str]]:
+    """
+    Load held-out domain evaluation texts from a directory.
+
+    Expected structure:
+        data_dir/
+            code.txt      (one document per line, or multi-line docs separated by \\n\\n---\\n\\n)
+            math.txt
+            science.txt
+            web.txt
+            books.txt
+
+    Args:
+        data_dir: Path to directory containing domain text files.
+        max_samples_per_domain: Maximum samples to load per domain.
+
+    Returns:
+        Dict mapping domain name -> list of text samples.
+    """
+    data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Domain eval data directory not found: {data_dir}")
+
+    domain_texts = {}
+    separator = "\n\n---\n\n"
+
+    for domain in ["code", "math", "science", "web", "books"]:
+        filepath = data_dir / f"{domain}.txt"
+        if not filepath.exists():
+            logger.warning(f"Missing domain eval file: {filepath}")
+            continue
+
+        text = filepath.read_text(encoding="utf-8")
+        # Split by separator if present, otherwise by double newline
+        if separator in text:
+            samples = [s.strip() for s in text.split(separator) if s.strip()]
+        else:
+            samples = [s.strip() for s in text.split("\n\n") if s.strip()]
+
+        samples = samples[:max_samples_per_domain]
+        if samples:
+            domain_texts[domain] = samples
+            logger.info(f"Loaded {len(samples)} eval samples for domain '{domain}'")
+
+    if not domain_texts:
+        raise FileNotFoundError(
+            f"No domain eval files found in {data_dir}. "
+            f"Expected files: code.txt, math.txt, science.txt, web.txt, books.txt"
+        )
+
+    return domain_texts
 
 # Domain evaluation prompts — curated excerpts representative of each domain.
 # These are used when no external eval data is available.
@@ -72,13 +130,20 @@ def compute_domain_bpb(
     """
     if domain_texts is None:
         domain_texts = DOMAIN_PROMPTS
+        logger.warning(
+            "Using built-in domain prompts (n=3/domain). "
+            "Results are NOT statistically meaningful for publication. "
+            "Pass --domain-eval-dir to use a real validation dataset."
+        )
 
     model.eval()
     results = {}
+    total_samples = 0
 
     for domain, texts in domain_texts.items():
         total_loss = 0.0
         total_bytes = 0
+        n_domain_samples = 0
 
         for text in texts:
             # Encode text
@@ -112,7 +177,9 @@ def compute_domain_bpb(
 
             total_loss += loss.item()
             total_bytes += text_bytes
+            n_domain_samples += 1
 
+        total_samples += n_domain_samples
         # Convert nats to bits, normalize by bytes
         if total_bytes > 0:
             bpb = total_loss / (total_bytes * math.log(2))
@@ -129,4 +196,5 @@ def compute_domain_bpb(
     else:
         results['overall'] = float('inf')
 
+    results['n_samples'] = total_samples
     return results

@@ -33,7 +33,7 @@ from model import (
     Gate,
     Expert,
 )
-from config import get_nanoseek_config
+from config import get_config
 
 
 # =============================================================================
@@ -400,7 +400,7 @@ def test_nanoseek_config():
     print("TEST 7: NanoSeek Config Integration")
     print("=" * 60)
 
-    config = get_nanoseek_config()
+    config = get_config("1b")
 
     print(f"NanoSeek MoE Configuration:")
     print(f"  hidden_size: {config.hidden_size}")

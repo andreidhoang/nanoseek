@@ -15,50 +15,46 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from nanoseek.config import (
-    NanoSeekConfig, MLAConfig, MoEConfig, MTPConfig,
-    SparseAttentionConfig,
-)
+from nanoseek.config import NanoSeekConfig
 from nanoseek.model import (
     NanoSeekModel, Expert, MoE, MultiTokenPrediction,
     get_mtp_loss_weight,
 )
+
+import warnings
 
 
 # ─── Minimal config: 2 layers (1 dense + 1 MoE), 8 experts ─────────────────
 
 @pytest.fixture(scope="module")
 def cfg():
-    return NanoSeekConfig(
-        hidden_size=256,
-        num_layers=2,
-        num_heads=4,
-        intermediate_size=512,
-        vocab_size=1000,
-        max_position_embeddings=128,
-        mla=MLAConfig(
-            q_lora_rank=55,
-            kv_lora_rank=18,
-            qk_nope_head_dim=48,
-            qk_rope_head_dim=16,
-            v_head_dim=48,
-        ),
-        moe=MoEConfig(
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return NanoSeekConfig(
+            hidden_size=256,
+            num_layers=2,
+            num_heads=4,
+            intermediate_size=512,
+            vocab_size=1000,
+            max_position_embeddings=128,
+            # MLA overrides for small test
+            _qk_nope_head_dim=48,
+            _qk_rope_head_dim=16,
+            _v_head_dim=48,
+            _q_lora_rank_override=55,
+            _kv_lora_rank_override=18,
+            # MoE overrides for small test
             n_routed_experts=8,
             num_experts_per_tok=2,
             n_shared_experts=1,
-            moe_intermediate_size=128,
+            _moe_intermediate_size_override=128,
             n_group=2,
             topk_group=1,
             first_k_dense_replace=1,
-        ),
-        mtp=MTPConfig(
+            # MTP
             num_mtp_modules=1,
-            mtp_num_heads=2,
-        ),
-        sparse=SparseAttentionConfig(enabled=False),
-        gradient_checkpointing=False,  # Faster for CPU tests
-    )
+            gradient_checkpointing=False,  # Faster for CPU tests
+        )
 
 
 @pytest.fixture(scope="module")

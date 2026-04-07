@@ -57,9 +57,7 @@ import torch.distributed as dist
 # NanoSeek imports
 from nanoseek.nanoseek.config import (
     NanoSeekConfig,
-    get_nanoseek_config,
-    get_nanoseek_ablation_config,
-    get_nanoseek_anchor_config,  # kept for backwards compat; not a training scale
+    get_config,
 )
 from nanoseek.nanoseek.model import NanoSeekModel
 from nanoseek.nanoseek.common import (
@@ -102,14 +100,10 @@ def load_nanoseek_model(
         ema_state: EMA state dict if use_ema=True, else None
     """
     # Get config for scale
-    config_map = {
-        "ablation": get_nanoseek_ablation_config,
-        "1b": get_nanoseek_config,
-    }
-    if scale not in config_map:
-        raise ValueError(f"Unknown scale: {scale}. Choose from {list(config_map.keys())}")
-    
-    config = config_map[scale]()
+    if scale not in ("ablation", "1b"):
+        raise ValueError(f"Unknown scale: {scale}. Choose from ['ablation', '1b']")
+
+    config = get_config(scale)
     print0(f"Loading NanoSeek-{scale} config:")
     print0(f"  Hidden size: {config.hidden_size}")
     print0(f"  Layers: {config.num_layers}")

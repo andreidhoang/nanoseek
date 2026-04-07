@@ -166,14 +166,15 @@ def compute_mtp_acceptance_rate(
         outputs = model(batch_x)
         if not isinstance(outputs, dict):
             logger.warning("Model does not return dict — cannot compute MTP acceptance")
-            return {'acceptance_rate': 0.0, 'note': 'model does not return dict outputs'}
+            return {'acceptance_rate': -1.0, 'note': 'model does not return dict outputs'}
 
         # Check if model has MTP logits
         mtp_logits = outputs.get('mtp_logits', None)
         if mtp_logits is None:
-            # Try to get MTP predictions from auxiliary outputs
+            # MTP not enabled or not producing logits — return -1.0 sentinel
+            # so W&B charts distinguish "MTP disabled" from "MTP acceptance = 0%"
             logger.info("No mtp_logits in outputs — MTP may not be enabled")
-            return {'acceptance_rate': 0.0, 'note': 'no mtp_logits in model output'}
+            return {'acceptance_rate': -1.0, 'note': 'no mtp_logits in model output'}
 
         # mtp_logits shape: [n_predict, B, S, V] or [B, S, V] for single prediction
         if mtp_logits.dim() == 4:

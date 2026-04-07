@@ -34,11 +34,8 @@ from torch.nn.utils import clip_grad_norm_
 
 from nanoseek.nanoseek.config import (
     NanoSeekConfig,
-    get_nanoseek_config,
-    get_nanoseek_ablation_config,
-    get_nanoseek_anchor_config,  # kept for engine.py smoke test; not a training scale
-    get_training_phases,
-    apply_phase_config,
+    get_config,
+    create_from_depth,
 )
 from nanoseek.nanoseek.model import NanoSeekModel, get_mtp_loss_weight
 
@@ -60,9 +57,9 @@ from nanoseek.nanoseek.checkpoint_manager import (
 )
 
 # Eval modules (RULE 7: H_load + I_spec; RULE 9: MTP acceptance rate)
-from nanoseek.eval.information_metrics import compute_i_spec
+from nanoseek.eval.information_metrics import compute_i_spec, compute_i_spec_labeled
 from nanoseek.eval.moe_diagnostics import compute_mtp_acceptance_rate, compute_dead_experts
-from nanoseek.eval.domain_bpb import compute_domain_bpb
+from nanoseek.eval.domain_bpb import compute_domain_bpb, load_domain_eval_data
 
 
 parser = argparse.ArgumentParser(description="NanoSeek Stage 1 Pre-Training")
@@ -75,8 +72,9 @@ parser.add_argument("--device-type", type=str, default="",
 
 # Model scale selection
 parser.add_argument("--scale", type=str, default="ablation",
-                    choices=["ablation", "1b"],
-                    help="which config to use: ablation(1280h, PRIMARY), 1b(2048h, graduation)")
+                    help="config scale: anchor, ablation, 1b, or d<N> (e.g. d16). "
+                         "Overridden by --depth when > 0")
+
 # muP reference width (ablation = base scale, 1B = target)
 parser.add_argument("--mup-ref-width", type=int, default=1280,
                     help="reference hidden_size for muP scaling (ablation config)")
@@ -127,30 +125,26 @@ parser.add_argument("--resume-from-step", type=int, default=-1,
 parser.add_argument("--seed", type=int, default=42,
                     help="random seed for reproducibility")
 
-# ─── Ablation flags (Phase 3 stability & architecture experiments) ───
+# ─── MoE ablation flags (Phase 3 architecture experiments) ───
 parser.add_argument("--no-seq-aux", action="store_true",
                     help="Ablation: disable sequence-level auxiliary loss (set alpha=0)")
-parser.add_argument("--no-grad-clip", action="store_true",
-                    help="Ablation: disable gradient clipping (set max_norm=inf)")
 parser.add_argument("--aux-loss-type", type=str, default="bias",
                     choices=["bias", "classic"],
                     help="Ablation: 'bias' = aux-loss-free balancing (V3), "
-                         "'classic' = traditional aux loss (alpha=0.01)")
+                         "'classic' = traditional aux loss")
+parser.add_argument("--aux-loss-alpha", type=float, default=0.01,
+                    help="Aux loss coefficient when --aux-loss-type=classic "
+                         "(pilot: try 0.001, 0.01, 0.1)")
 parser.add_argument("--no-mtp", action="store_true",
                     help="Ablation: disable MTP (set lambda=0 throughout training)")
 parser.add_argument("--no-shared-experts", action="store_true",
                     help="Ablation: remove shared expert contribution (zero out)")
-parser.add_argument("--inject-bad-batch", type=int, default=-1,
-                    help="Ablation: multiply gradient by 10x at this step (-1 = disabled)")
 parser.add_argument("--no-compile", action="store_true",
                     help="Skip torch.compile (useful for debugging or incompatible GPUs)")
-parser.add_argument("--fp8", action="store_true",
-                    help="Enable FP8 training for MLA/shared expert matmuls (requires H100+)")
-
-# ─── Cost tracking (know when to kill a bad run) ───
-parser.add_argument("--cost-per-gpu-hour", type=float, default=0.0,
-                    help="$/hour per GPU for cost accounting (e.g. 0.79 for A6000, "
-                         "2.49 for H100 on RunPod). 0 = disable cost tracking.")
+# ─── Evaluation data ───
+parser.add_argument("--domain-eval-dir", type=str, default=None,
+                    help="Directory with domain eval text files (code.txt, math.txt, etc.). "
+                         "Without this, domain BPB uses 15 built-in prompts (not publication-quality).")
 
 # ─── Architecture override flags (Phase 3 architecture experiments) ───
 parser.add_argument("--num-experts", type=int, default=-1,
@@ -168,16 +162,17 @@ parser.add_argument("--total-tokens", type=int, default=-1,
 parser.add_argument("--hidden-size", type=int, default=-1,
                     help="Override hidden_size (for scaling sweep configs)")
 
-# ─── Profiling ───
-parser.add_argument("--profile", action="store_true",
-                    help="Enable torch.profiler + NVTX for Nsight. Profiles steps 6-15 "
-                         "then exits. Use with: nsys profile -t cuda,nvtx python -m ...")
-parser.add_argument("--profile-steps", type=int, default=10,
-                    help="Number of steps to profile (default: 10)")
-
-# ─── Config from YAML ───
-parser.add_argument("--config-yaml", type=str, default="",
-                    help="Path to YAML config file (overrides individual CLI flags)")
+# ─── Depth-based scaling (nanochat-style single dial, overrides --scale) ───
+parser.add_argument("--depth", type=int, default=-1,
+                    help="model depth (num_layers). Auto-derives width/batch/tokens. -1 = use --scale")
+parser.add_argument("--aspect-ratio", type=int, default=80,
+                    help="width = ceil(depth × ratio / 128) × 128. 80 → d16=1280 (ablation)")
+parser.add_argument("--target-flops", type=float, default=-1.0,
+                    help="target total FLOPs — overrides iteration count (for IsoFLOP sweeps)")
+parser.add_argument("--target-param-data-ratio", type=float, default=-1.0,
+                    help="tokens:scaling_params ratio (for compute-optimal training)")
+parser.add_argument("--total-batch-size", type=int, default=-1,
+                    help="total batch in tokens (-1 = auto for depth mode, config for scale mode)")
 
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
@@ -216,96 +211,21 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')
 
-# ─── W&B with ablation metadata ───
-# Ablation taxonomy: each run is tagged with its ablation group + specific variant
-# so that W&B filtering works: "show me all stability runs", "compare A vs C", etc.
-def _classify_ablation(run_name, args):
-    """Derive W&B group, tags, and notes from run name and ablation flags."""
-    tags = [f"scale:{args.scale}"]
-    group = f"{args.scale}"  # default: group by scale
-    notes = ""
-
-    # Detect ablation group from run name prefix
-    # HP search: hp-r1-* (Round 1 coarse), hp-r2-* (Round 2 fine),
-    #            hp-seed-* (Round 3 multi-seed), hp-wd-* (Round 4 weight decay),
-    #            hp-anchor-* (legacy Round 1 naming)
-    if run_name.startswith("hp-"):
-        tags.append("ablation:hp-transfer")
-        group = f"hp-{args.scale}"
-        if run_name.startswith("hp-r1-"):
-            tags.append("hp-round:1")
-            notes = "HP grid Round 1: coarse grid search"
-        elif run_name.startswith("hp-r2-"):
-            tags.append("hp-round:2")
-            notes = "HP grid Round 2: fine grid around R1 winner"
-        elif run_name.startswith("hp-seed-"):
-            tags.append("hp-round:3")
-            tags.append(f"seed:{args.seed}")
-            notes = "HP grid Round 3: multi-seed validation"
-        elif run_name.startswith("hp-wd-"):
-            tags.append("hp-round:4")
-            tags.append(f"weight_decay:{args.weight_decay}")
-            notes = "HP grid Round 4: weight decay sensitivity"
-        elif run_name.startswith("hp-anchor-"):
-            tags.append("hp-round:1")
-            tags.append("legacy-naming")
-            notes = "HP grid Round 1: coarse grid search (legacy naming)"
-        else:
-            notes = "muP hyperparameter transfer validation"
-    elif run_name.startswith("stab-"):
-        tags.append("ablation:stability")
-        group = f"stability-{args.scale}"
-        notes = "Training stability ablation (DeepSeek V3.2 techniques)"
-    elif run_name.startswith("arch-"):
-        tags.append("ablation:architecture")
-        group = f"architecture-{args.scale}"
-        notes = "Architecture sensitivity ablation"
-    elif run_name.startswith("gate1"):
-        tags.append("gate:smoke-test")
-        group = f"gate1-{args.scale}"
-        notes = "Gate 1 smoke test (100 steps)"
-
-    # Tag specific ablation flags
-    if args.no_seq_aux:
-        tags.append("variant:no-seq-aux")
-    if args.no_grad_clip:
-        tags.append("variant:no-grad-clip")
-    if args.aux_loss_type == "classic":
-        tags.append("variant:classic-aux-loss")
-    if args.no_mtp:
-        tags.append("variant:no-mtp")
-    if args.no_shared_experts:
-        tags.append("variant:no-shared-experts")
-    if args.inject_bad_batch >= 0:
-        tags.append(f"variant:bad-batch-{args.inject_bad_batch}")
-    if args.num_experts > 0:
-        tags.append(f"variant:experts-{args.num_experts}")
-    if args.top_k > 0:
-        tags.append(f"variant:topk-{args.top_k}")
-    if args.config_yaml:
-        tags.append(f"config:{os.path.basename(args.config_yaml)}")
-
-    return group, tags, notes
-
-ablation_group, ablation_tags, ablation_notes = _classify_ablation(args.run, args)
-
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
     project="nanoseek",
     name=args.run,
-    group=ablation_group,
-    tags=ablation_tags,
-    notes=ablation_notes,
     config=vars(args),  # CLI args (pre-override)
 )
-# ─── Select config from muP transfer path ───
-config_map = {
-    "ablation": get_nanoseek_ablation_config,
-    "1b":     get_nanoseek_config,
-}
-config = config_map[args.scale]()
+# ─── Config selection: --depth overrides --scale ───
+if args.depth > 0:
+    config = create_from_depth(args.depth, args.aspect_ratio)
+    print0(f"Model: depth={args.depth} → hidden={config.hidden_size}, "
+           f"heads={config.num_heads}, layers={config.num_layers}")
+else:
+    config = get_config(args.scale)
 
-print0(f"Model scale: {args.scale}")
+print0(f"Model config ({config.scale_name}):")
 print0(f"  hidden_size:   {config.hidden_size}")
 print0(f"  num_layers:    {config.num_layers}")
 print0(f"  n_experts:     {config.moe.n_routed_experts}")
@@ -321,7 +241,7 @@ def validate_config(cfg):
         errors.append(f"RULE 2: gamma_freeze_ratio={cfg.moe.gamma_freeze_ratio}, must be 0.95")
     if cfg.adam_beta2 != 0.95:
         errors.append(f"adam_beta2={cfg.adam_beta2}, expected 0.95 (DeepSeek style)")
-    if cfg.max_grad_norm != 1.0 and not args.no_grad_clip:
+    if cfg.max_grad_norm != 1.0:
         errors.append(f"max_grad_norm={cfg.max_grad_norm}, expected 1.0")
     if errors:
         for e in errors:
@@ -334,14 +254,10 @@ if args.no_seq_aux:
     config.moe.seq_aux_loss_alpha = 0.0
     print0("ABLATION: seq_aux disabled (alpha=0)")
 
-if args.no_grad_clip:
-    config.max_grad_norm = float('inf')
-    print0("ABLATION: gradient clipping disabled (max_norm=inf)")
-
 if args.aux_loss_type == "classic":
-    # Classic aux loss: higher alpha, no bias-based balancing
-    config.moe.seq_aux_loss_alpha = 0.01
-    print0("ABLATION: classic aux loss (alpha=0.01, bias updates will be skipped)")
+    # Classic aux loss: parametric alpha, no bias-based balancing
+    config.moe.seq_aux_loss_alpha = args.aux_loss_alpha
+    print0(f"ABLATION: classic aux loss (alpha={args.aux_loss_alpha}, bias updates will be skipped)")
 
 if args.no_mtp:
     config.mtp.mtp_loss_weight_initial = 0.0
@@ -351,9 +267,6 @@ if args.no_mtp:
 if args.no_shared_experts:
     config.moe.disable_shared_experts = True
     print0("ABLATION: shared experts disabled (output zeroed)")
-
-if args.inject_bad_batch >= 0:
-    print0(f"ABLATION: bad batch injection at step {args.inject_bad_batch} (10x gradient)")
 
 # ─── Architecture overrides (must come before model build) ───
 if args.num_experts > 0:
@@ -386,70 +299,18 @@ if args.hidden_size > 0:
     config.hidden_size = args.hidden_size
     print0(f"OVERRIDE: hidden_size {old_h} → {args.hidden_size}")
 
-# ─── YAML config override (loads all overrides from a single file) ───
-if args.config_yaml:
-    import yaml
-    with open(args.config_yaml, 'r') as f:
-        yaml_cfg = yaml.safe_load(f)
-    print0(f"Loading config overrides from {args.config_yaml}")
-    # Apply top-level overrides
-    for key in ['total_tokens', 'hidden_size', 'num_layers', 'sequence_length',
-                'vocab_size', 'max_grad_norm']:
-        if key in yaml_cfg:
-            old_val = getattr(config, key)
-            setattr(config, key, yaml_cfg[key])
-            print0(f"  YAML: {key} {old_val} → {yaml_cfg[key]}")
-    # Apply MoE overrides
-    if 'moe' in yaml_cfg:
-        for key, val in yaml_cfg['moe'].items():
-            if hasattr(config.moe, key):
-                old_val = getattr(config.moe, key)
-                setattr(config.moe, key, val)
-                print0(f"  YAML: moe.{key} {old_val} → {val}")
-    # Apply MTP overrides
-    if 'mtp' in yaml_cfg:
-        for key, val in yaml_cfg['mtp'].items():
-            if hasattr(config.mtp, key):
-                old_val = getattr(config.mtp, key)
-                setattr(config.mtp, key, val)
-                print0(f"  YAML: mtp.{key} {old_val} → {val}")
-    # Apply MLA overrides
-    if 'mla' in yaml_cfg:
-        for key, val in yaml_cfg['mla'].items():
-            if hasattr(config.mla, key):
-                old_val = getattr(config.mla, key)
-                setattr(config.mla, key, val)
-                print0(f"  YAML: mla.{key} {old_val} → {val}")
-    # Apply training overrides (LR, etc.)
-    if 'training' in yaml_cfg:
-        for key, val in yaml_cfg['training'].items():
-            if key in vars(args):
-                old_val = getattr(args, key.replace('-', '_'))
-                setattr(args, key.replace('-', '_'), val)
-                print0(f"  YAML: args.{key} {old_val} → {val}")
-
 validate_config(config)
 
+# ─── Load domain eval data (if provided) ───
+_domain_eval_texts = None
+if args.domain_eval_dir:
+    _domain_eval_texts = load_domain_eval_data(args.domain_eval_dir)
+    print0(f"Loaded domain eval data from {args.domain_eval_dir} "
+           f"({sum(len(v) for v in _domain_eval_texts.values())} total samples)")
+
 # ─── Log effective config to W&B (post-ablation overrides) ───
-# This captures the ACTUAL values used, not just CLI args.
-# Critical for reproducing: "what was seq_aux_loss_alpha for run stab-C?"
 if not use_dummy_wandb:
-    wandb_run.config.update({
-        "effective/seq_aux_loss_alpha": config.moe.seq_aux_loss_alpha,
-        "effective/max_grad_norm": config.max_grad_norm,
-        "effective/mtp_loss_weight_initial": config.mtp.mtp_loss_weight_initial,
-        "effective/mtp_loss_weight_final": config.mtp.mtp_loss_weight_final,
-        "effective/disable_shared_experts": config.moe.disable_shared_experts,
-        "effective/gamma_freeze_ratio": config.moe.gamma_freeze_ratio,
-        "effective/aux_loss_type": args.aux_loss_type,
-        "effective/inject_bad_batch": args.inject_bad_batch,
-        "effective/n_routed_experts": config.moe.n_routed_experts,
-        "effective/num_experts_per_tok": config.moe.num_experts_per_tok,
-        "effective/n_group": config.moe.n_group,
-        "effective/topk_group": config.moe.topk_group,
-        "effective/total_tokens": config.total_tokens,
-        "effective/hidden_size": config.hidden_size,
-    }, allow_val_change=True)
+    wandb_run.config.update(asdict(config), allow_val_change=True)
 
 # ─── Build model ───
 print0("Building model on meta device...")
@@ -459,12 +320,6 @@ with torch.device("meta"):
 # Move to device and initialize
 model.to_empty(device=device)
 model.init_weights()
-
-# ─── Profiling setup ───
-if args.profile:
-    import nanoseek.nanoseek.model as _model_module
-    _model_module.enable_nvtx()
-    print0("NVTX markers enabled for Nsight profiling")
 
 # ─── Parameter counts ───
 param_counts = model.num_parameters()
@@ -487,6 +342,82 @@ print0(f"Parameters: {n_active:,} active / {n_total:,} total "
 #
 num_flops_per_token = 6 * n_active
 print0(f"FLOPs per token: {num_flops_per_token:.2e}")
+
+# ═══════════════════════════════════════════════════════════════════
+# Auto-Compute: Training Horizon + Batch Size (Scaling Law Mode)
+# ═══════════════════════════════════════════════════════════════════
+#
+# For depth-based configs, tokens and batch are auto-computed:
+#   1. scaling_params = active - embed (Kaplan convention)
+#   2. target_tokens = ratio × scaling_params
+#   3. batch = B_REF × (target_tokens / D_REF)^0.383 (Power Lines paper)
+#   4. num_iterations = target_tokens / batch
+#
+# For named scales (anchor/ablation/1b), config values are used unless
+# --target-param-data-ratio or --total-batch-size override them.
+# ═══════════════════════════════════════════════════════════════════
+
+# ─── Scaling params for training horizon ───
+scaling_counts = model.num_scaling_params()
+n_scaling = scaling_counts['scaling']
+
+# Parseable lines for runs/*.sh extraction
+for key, val in scaling_counts.items():
+    print0(f"{key:24s}: {val:,}")
+
+# Reference: d16 ablation (where HPs are tuned)
+D_REF = 8_200_000_000   # ablation training tokens
+B_REF = 524_288          # ablation batch: 128 × 4096
+
+# ─── Training tokens ───
+if args.target_param_data_ratio > 0:
+    config.total_tokens = int(args.target_param_data_ratio * n_scaling)
+    print0(f"Auto-computed tokens: {config.total_tokens:,} "
+           f"(ratio={args.target_param_data_ratio:.1f} × scaling={n_scaling:,})")
+elif args.total_tokens > 0:
+    config.total_tokens = args.total_tokens
+    print0(f"OVERRIDE: total_tokens → {args.total_tokens:,}")
+elif config.total_tokens <= 0:
+    if args.target_flops <= 0 and args.num_iterations <= 0:
+        raise ValueError(
+            "No training horizon specified. Use --target-param-data-ratio, "
+            "--target-flops, --num-iterations, --total-tokens, or a named --scale")
+    # For batch sizing with --target-flops or --num-iterations: use Chinchilla default
+    config.total_tokens = int(20 * n_scaling)
+    print0(f"Using Chinchilla default for batch sizing: {config.total_tokens:,} tokens")
+
+# ─── Batch size (Power Lines: B_opt ∝ D^0.383) ───
+if args.total_batch_size > 0:
+    config.global_batch_size = args.total_batch_size // config.sequence_length
+    print0(f"Batch size override: {args.total_batch_size:,} tokens "
+           f"({config.global_batch_size} seqs)")
+elif config.global_batch_size <= 0:
+    # Auto-compute for depth mode (config.global_batch_size starts at 0)
+    batch_ratio = config.total_tokens / D_REF
+    predicted = B_REF * batch_ratio ** 0.383
+    auto_batch = 2 ** round(math.log2(max(predicted, config.sequence_length)))
+    config.global_batch_size = auto_batch // config.sequence_length
+    print0(f"Auto-computed batch: {auto_batch:,} tokens "
+           f"({config.global_batch_size} seqs, Power Lines: D/D_ref={batch_ratio:.2f})")
+# else: named scale provides config.global_batch_size
+
+# ─── Compute iterations ───
+total_batch_tokens = config.global_batch_size * config.sequence_length
+if args.num_iterations > 0:
+    num_iterations = args.num_iterations
+    config.total_tokens = num_iterations * total_batch_tokens
+    print0(f"Using user-provided iterations: {num_iterations:,}")
+elif args.target_flops > 0:
+    num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_tokens))
+    config.total_tokens = num_iterations * total_batch_tokens
+    print0(f"Calculated iterations from target FLOPs ({args.target_flops:.2e}): {num_iterations:,}")
+else:
+    num_iterations = config.total_tokens // total_batch_tokens
+    print0(f"Calculated iterations from total_tokens: {num_iterations:,}")
+
+print0(f"Training plan: {num_iterations:,} iters × {total_batch_tokens:,} tok/step "
+       f"= {config.total_tokens:,} tokens")
+print0(f"Tokens:Scaling ratio: {config.total_tokens / n_scaling:.1f}")
 print0(f"Total training FLOPs: {num_flops_per_token * config.total_tokens:.2e}")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -552,7 +483,7 @@ print0(f"  combined (hidden weights) = {batch_lr_scale * width_lr_scale:.4f}")
 #     = λ_ref × √(B/B_ref) × (D_ref/D)
 # ═══════════════════════════════════════════════════════════════════
 
-D_ref = get_nanoseek_ablation_config().total_tokens  # ablation training tokens (reference scale)
+D_ref = get_config("ablation").total_tokens  # ablation training tokens (reference scale)
 D = config.total_tokens                            # current training tokens
 
 weight_decay_scaled = args.weight_decay * batch_lr_scale * (D_ref / D)
@@ -1008,14 +939,9 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 print0(f"Vocab size: {tokenizer.get_vocab_size():,}")
 
-# ─── Number of training iterations ───
+# ─── Training iterations (computed in auto-compute cascade above) ───
 total_batch_tokens = config.global_batch_size * config.sequence_length
-if args.num_iterations > 0:
-    num_iterations = args.num_iterations
-else:
-    num_iterations = config.total_tokens // total_batch_tokens
-print0(f"Total iterations: {num_iterations:,}")
-print0(f"Total tokens: {total_batch_tokens * num_iterations:,}")
+print0(f"Training loop: {num_iterations:,} iterations, {total_batch_tokens:,} tokens/step")
 
 # ─── LR schedule phase boundaries ───
 # Config says: warmup → constant until 70% → cosine decay 70%→95% → lr_min
@@ -1170,41 +1096,12 @@ def distributed_clip_grad_norm_(parameters, max_norm):
     return torch.tensor(global_norm)
 
 
-# ─── FP8 training (must be BEFORE torch.compile) ───
-# FP8 replaces CastLinear → Float8CastLinear for eligible layers.
-# Must happen before compile so the FP8 autograd function gets compiled into the graph.
-_fp8_enabled = False
-if args.fp8:
-    from nanoseek.nanoseek.fp8 import is_fp8_available, convert_nanoseek_to_fp8
-    available, reason = is_fp8_available()
-    if not available:
-        print0(f"WARNING: FP8 requested but not available ({reason}). Continuing with BF16.")
-    else:
-        num_converted, num_skipped, num_total = convert_nanoseek_to_fp8(orig_model)
-        _fp8_enabled = True
-        print0(f"✓ FP8 training enabled ({reason})")
-        print0(f"  Converted: {num_converted}/{num_total} CastLinear layers to Float8CastLinear")
-        print0(f"  Skipped: {num_skipped} (router/embedding/small dims)")
-
-# ─── torch.compile with timing ───
-# torch.compile is lazy — actual kernel compilation happens on first forward pass.
-# Expected compile times by scale:
-#   anchor (~55M):  1-5 min (first run), <30s (cached)
-#   500M:           2-8 min (first run), <30s (cached)
-#   1B:             3-10 min (first run), <30s (cached)
-# If compile exceeds 15 min, something is wrong (PyTorch/CUDA version mismatch,
-# incompatible GPU architecture, or infinite recompilation loop).
-COMPILE_TIMEOUT_MINUTES = 15
-_compile_start_time = time.time()
+# ─── torch.compile ───
 if args.no_compile:
     print0("torch.compile SKIPPED (--no-compile flag set)")
 else:
     model = torch.compile(model, dynamic=False)
-    print0(f"torch.compile registered (lazy — actual compilation on first forward pass)")
-    print0(f"  Compile timeout: {COMPILE_TIMEOUT_MINUTES} min. If step 0 takes longer, check:")
-    print0(f"  1. PyTorch version supports your GPU (run: python -c \"import torch; torch.zeros(1).cuda()\")")
-    print0(f"  2. CUDA toolkit version matches PyTorch build")
-    print0(f"  3. Try --no-compile flag or TORCH_COMPILE_DISABLE=1 to skip compilation")
+    print0("torch.compile registered (lazy — compiles on first forward pass)")
 
 # ─── EMA tracker ───
 ema_tracker = EMATracker(orig_model, decay=args.ema_decay)
@@ -1213,7 +1110,7 @@ print0(f"EMA tracker initialized (decay={args.ema_decay}, update every {args.ema
 # ─── Checkpoint manager (atomic writes + disk cleanup) ───
 # Include run name in checkpoint dir so ablation runs don't overwrite each other.
 # e.g., checkpoints/nanoseek_anchor/stab-A-baseline/
-checkpoint_dir = os.path.join("checkpoints", f"nanoseek_{args.scale}", args.run)
+checkpoint_dir = os.path.join("checkpoints", f"nanoseek_{config.scale_name}", args.run)
 ckpt_manager = CheckpointManager(
     checkpoint_dir=checkpoint_dir,
     save_every=args.save_every,
@@ -1242,7 +1139,6 @@ signal.signal(signal.SIGINT, _shutdown_handler)
 resume_step = 0
 resume_dataloader_state = None
 resume_loop_state = {}
-resume_health_state = None
 
 if args.resume_from_step >= 0:
     resume_step_arg = args.resume_from_step if args.resume_from_step > 0 else None  # 0 = latest
@@ -1273,11 +1169,9 @@ if args.resume_from_step >= 0:
     resume_step = loaded_step
     resume_dataloader_state = metadata.get("dataloader_state_dict", None)
     resume_loop_state = metadata.get("loop_state", {})
-    resume_health_state = metadata.get("health_monitor_state", None)
     print0(f"  Resuming from step {resume_step}, tokens={metadata.get('tokens_processed', 'unknown')}")
 
     # Re-compile after loading weights
-    _compile_start_time = time.time()
     if not args.no_compile:
         model = torch.compile(orig_model, dynamic=False)
 
@@ -1298,201 +1192,8 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
 x, y, dataloader_state_dict = next(train_loader)
 print0(f"First batch prefetched: {x.shape} inputs, {y.shape} targets")
 
-# ═══════════════════════════════════════════════════════════════════
-# Training Health Monitor — Automated Tripwires
-# ═══════════════════════════════════════════════════════════════════
-#
-# What top-tier labs (DeepSeek, OLMo, Meta) learned:
-#   1. Gradient norm is the #1 leading indicator (OLMo: blowup at GN>0.4)
-#   2. Loss spike frequency matters more than individual spikes
-#   3. Expert collapse is silent — monitor H_load continuously
-#   4. ZClip (adaptive grad norm clipping) > fixed threshold
-#
-# These tripwires run every step with ~0 overhead (just comparisons).
-# ═══════════════════════════════════════════════════════════════════
-
-class TrainingHealthMonitor:
-    """Automated early-warning system for training instability.
-
-    Tracks 4 signals that catch 90% of problems (from frontier lab postmortems):
-    1. Gradient norm: EMA + z-score spike detection (ZClip-inspired)
-    2. Loss: rolling average + spike ratio detection
-    3. H_load: expert collapse detection
-    4. Throughput: regression detection (thermal throttle, mem frag, recompilation)
-
-    Reference: OLMo 2 (GN threshold), ZClip (z-score), DeepSeek V3 (zero rollbacks)
-    """
-    def __init__(self, warmup_steps=0):
-        # Gradient norm tracking (ZClip-inspired adaptive detection)
-        self.grad_norm_ema = 0.0
-        self.grad_norm_var_ema = 0.0
-        self.grad_norm_ema_beta = 0.99
-        self.grad_norm_initialized = False
-
-        # Loss tracking
-        self.loss_ema = 0.0
-        self.loss_ema_beta = 0.95
-        self.loss_initialized = False
-
-        # Throughput tracking (tok/s regression detection)
-        # Why: silent throughput killers — GPU thermal throttling, memory fragmentation,
-        # torch.compile recompilation, dataloader I/O stalls — don't show in loss/gradients.
-        # A 15% tok/s drop means you're burning 15% more $/token for no reason.
-        self.throughput_ema = 0.0
-        self.throughput_var_ema = 0.0
-        self.throughput_ema_beta = 0.95
-        self.throughput_initialized = False
-        # Skip first N steps (step 0 includes compile time, step 1-5 are warmup)
-        self.throughput_warmup_steps = max(warmup_steps, 10)
-
-        # Spike counting (OLMo insight: frequency increase = real danger)
-        self.grad_spikes_last_100 = []
-        self.loss_spikes_last_100 = []
-
-        # Consecutive NaN counter
-        self.nan_count = 0
-
-        # Grace period: during LR warmup, gradient norms naturally grow monotonically.
-        # Spike detection during this period generates only false positives.
-        self.warmup_steps = warmup_steps
-
-    def update(self, step, grad_norm_val, loss_val, h_load_val, tok_per_sec=0):
-        """Check all tripwires. Returns list of alerts (empty = healthy)."""
-        alerts = []
-
-        # ─── NaN/Inf detection (IMMEDIATE — always active, even during warmup) ───
-        gn = grad_norm_val.item() if hasattr(grad_norm_val, 'item') else float(grad_norm_val)
-        lv = loss_val.item() if hasattr(loss_val, 'item') else float(loss_val)
-        hl = h_load_val.item() if hasattr(h_load_val, 'item') else float(h_load_val)
-
-        if math.isnan(gn) or math.isinf(gn) or math.isnan(lv) or math.isinf(lv):
-            self.nan_count += 1
-            alerts.append(("CRITICAL", f"NaN/Inf detected at step {step} "
-                          f"(grad_norm={gn}, loss={lv}). Count: {self.nan_count}"))
-            return alerts
-        self.nan_count = 0
-
-        in_warmup = step < self.warmup_steps
-
-        # ─── Gradient norm: EMA + z-score (ZClip-inspired) ───
-        # Always update EMA (even during warmup) so it's calibrated when warmup ends
-        if not self.grad_norm_initialized:
-            self.grad_norm_ema = gn
-            self.grad_norm_var_ema = 0.0
-            self.grad_norm_initialized = True
-        else:
-            beta = self.grad_norm_ema_beta
-            self.grad_norm_var_ema = beta * self.grad_norm_var_ema + (1 - beta) * (gn - self.grad_norm_ema) ** 2
-            self.grad_norm_ema = beta * self.grad_norm_ema + (1 - beta) * gn
-
-            # Skip spike detection during warmup (gradients grow monotonically with LR)
-            if not in_warmup:
-                # Z-score spike detection
-                std = math.sqrt(self.grad_norm_var_ema + 1e-8)
-                z_score = (gn - self.grad_norm_ema) / std
-                if z_score > 4.0:
-                    alerts.append(("WARNING", f"Gradient norm spike: {gn:.4f} "
-                                  f"(z={z_score:.1f}, ema={self.grad_norm_ema:.4f})"))
-                    self.grad_spikes_last_100.append(step)
-
-        # ─── Loss spike detection ───
-        if not self.loss_initialized:
-            self.loss_ema = lv
-            self.loss_initialized = True
-        else:
-            self.loss_ema = self.loss_ema_beta * self.loss_ema + (1 - self.loss_ema_beta) * lv
-
-            if not in_warmup:
-                ratio = lv / max(self.loss_ema, 1e-8)
-                if ratio > 2.0:
-                    alerts.append(("WARNING", f"Loss spike: {lv:.4f} "
-                                  f"({ratio:.1f}x rolling avg {self.loss_ema:.4f})"))
-                    self.loss_spikes_last_100.append(step)
-                if ratio > 3.0:
-                    alerts.append(("CRITICAL", f"Severe loss spike: {lv:.4f} "
-                                  f"({ratio:.1f}x avg). Consider checkpoint restore."))
-
-        # ─── Expert collapse detection (always active) ───
-        if hl < 2.0:
-            alerts.append(("CRITICAL", f"Expert collapse: H_load={hl:.2f} bits "
-                          f"(threshold: 2.0). Routing is degenerate."))
-        elif hl < 4.0 and step > self.warmup_steps:
-            alerts.append(("WARNING", f"H_load declining: {hl:.2f} bits "
-                          f"(healthy > 4.0 at init)"))
-
-        # ─── Spike frequency (OLMo insight) — only after warmup ───
-        if not in_warmup:
-            self.grad_spikes_last_100 = [s for s in self.grad_spikes_last_100 if step - s < 100]
-            self.loss_spikes_last_100 = [s for s in self.loss_spikes_last_100 if step - s < 100]
-
-            if len(self.grad_spikes_last_100) >= 5:
-                alerts.append(("WARNING", f"Spike frequency increasing: "
-                              f"{len(self.grad_spikes_last_100)} grad spikes in last 100 steps"))
-            if len(self.loss_spikes_last_100) >= 3:
-                alerts.append(("WARNING", f"Loss spike frequency: "
-                              f"{len(self.loss_spikes_last_100)} spikes in last 100 steps"))
-
-        # ─── Throughput regression detection ───
-        # After throughput stabilizes (past compile warmup), a sustained drop means
-        # something changed: thermal throttle, memory fragmentation, recompilation,
-        # or dataloader stall. Each burns GPU-hours for no training benefit.
-        if tok_per_sec > 0 and step > self.throughput_warmup_steps:
-            tps = float(tok_per_sec)
-            if not self.throughput_initialized:
-                self.throughput_ema = tps
-                self.throughput_var_ema = 0.0
-                self.throughput_initialized = True
-            else:
-                beta = self.throughput_ema_beta
-                self.throughput_var_ema = beta * self.throughput_var_ema + (1 - beta) * (tps - self.throughput_ema) ** 2
-                self.throughput_ema = beta * self.throughput_ema + (1 - beta) * tps
-
-                std = math.sqrt(self.throughput_var_ema + 1e-8)
-                # Alert on sustained drops (z-score < -3 = throughput fell well below normal)
-                z_score = (tps - self.throughput_ema) / std
-                drop_pct = 100 * (1 - tps / max(self.throughput_ema, 1))
-                if z_score < -3.0 and drop_pct > 15:
-                    alerts.append(("WARNING", f"Throughput regression: {tps:,.0f} tok/s "
-                                  f"({drop_pct:.0f}% below EMA {self.throughput_ema:,.0f}). "
-                                  f"Check: thermal throttle, mem frag, dataloader stall."))
-
-        return alerts
-
-    def state_dict(self):
-        """Serialize health monitor state for checkpoint persistence.
-
-        Without this, resuming from checkpoint restarts EMA/variance estimates
-        from zero, giving uncalibrated spike detection for ~100+ steps post-resume.
-        """
-        return {
-            'grad_norm_ema': self.grad_norm_ema,
-            'grad_norm_var_ema': self.grad_norm_var_ema,
-            'grad_norm_initialized': self.grad_norm_initialized,
-            'loss_ema': self.loss_ema,
-            'loss_initialized': self.loss_initialized,
-            'throughput_ema': self.throughput_ema,
-            'throughput_var_ema': self.throughput_var_ema,
-            'throughput_initialized': self.throughput_initialized,
-            'nan_count': self.nan_count,
-            'grad_spikes_last_100': list(self.grad_spikes_last_100),
-            'loss_spikes_last_100': list(self.loss_spikes_last_100),
-        }
-
-    def load_state_dict(self, state):
-        """Restore health monitor state from checkpoint."""
-        for key, val in state.items():
-            if hasattr(self, key):
-                setattr(self, key, val)
-
-
-health_monitor = TrainingHealthMonitor(warmup_steps=warmup_steps)
-
-# Restore health monitor state from checkpoint (prevents uncalibrated spike
-# detection for ~100 steps post-resume due to zeroed EMA/variance estimates)
-if resume_step > 0 and resume_health_state is not None:
-    health_monitor.load_state_dict(resume_health_state)
-    print0(f"  Health monitor state restored (grad_norm_ema={health_monitor.grad_norm_ema:.4f}, "
-           f"loss_ema={health_monitor.loss_ema:.4f})")
+# ─── NaN tracking ───
+_nan_count = 0
 
 # ─── Training loop state ───
 step = resume_step
@@ -1508,7 +1209,9 @@ while True:
 
     # ─────────────────────────────────────────────────────────────
     # EVALUATE (RULE 1: ALL eval uses EMA weights)
-    # Ensure EMA is up-to-date before evaluation (even if not on ema_every boundary)
+    # Masterplan: ALL instrumentation every eval_every (250) steps:
+    #   - ema_val_bpb, I_spec (labeled + cluster), domain BPB,
+    #   - dead experts, MTP acceptance, per-layer routing entropy
     # ─────────────────────────────────────────────────────────────
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         if step > 0:
@@ -1518,70 +1221,92 @@ while True:
         # Fresh val_loader for BPB eval — each metric gets its own loader
         # to avoid consuming data that subsequent metrics need.
         val_loader_bpb = build_val_loader()
-        # Swap EMA weights onto orig_model, evaluate, then restore.
-        # disable_fp8: revert Float8CastLinear → CastLinear for BF16 evaluation
-        # so val_bpb measures model quality, not FP8 quantization noise.
-        _fp8_ctx = None
-        if _fp8_enabled:
-            from nanoseek.nanoseek.fp8 import disable_fp8
-            _fp8_ctx = disable_fp8(orig_model)
-            _fp8_ctx.__enter__()
         with ema_tracker.apply(orig_model):
             ema_val_bpb = evaluate_nanoseek_bpb(orig_model, val_loader_bpb, eval_steps, token_bytes)
 
-            # ─── Milestone eval: I_spec, domain BPB, dead experts (RULE 7) ───
-            progress = step / max(num_iterations, 1)
-            is_milestone = any(abs(progress - p) < (0.5 / num_iterations + 1e-9) for p in [0.20, 0.50, 0.80, 1.00])
-            milestone_metrics = {}
+            # ─── Full instrumentation every eval_every steps (Masterplan §V) ───
+            specialization_metrics = {}
 
-            if is_milestone or last_step:
-                print0(f"  Milestone eval at {progress:.1%}...")
-                try:
-                    val_loader_ispec = build_val_loader()
-                    i_spec_result = compute_i_spec(orig_model, val_loader_ispec, device)
-                    milestone_metrics["eval/i_spec_mean"] = i_spec_result['i_spec_mean']
-                    for i, v in enumerate(i_spec_result.get('i_spec_per_layer', [])):
-                        milestone_metrics[f"eval/i_spec_layer_{i}"] = v
-                    print0(f"  I_spec: {i_spec_result['i_spec_mean']:.4f}")
-                except Exception as e:
-                    print0(f"  I_spec failed: {e}")
+            # 1. Labeled-domain I_spec (PRIMARY — Masterplan Workstream 1)
+            #    Uses ground-truth domain labels for I(E; D).
+            #    Falls back to built-in prompts if no --domain-eval-dir.
+            try:
+                from nanoseek.eval.domain_bpb import DOMAIN_PROMPTS
+                domain_texts_for_ispec = _domain_eval_texts if _domain_eval_texts else DOMAIN_PROMPTS
+                i_spec_labeled = compute_i_spec_labeled(
+                    orig_model, domain_texts_for_ispec, tokenizer, device,
+                    n_experts=config.moe.n_routed_experts,
+                )
+                specialization_metrics["eval/i_spec_labeled_mean"] = i_spec_labeled['i_spec_labeled_mean']
+                for i, v in enumerate(i_spec_labeled.get('i_spec_labeled_per_layer', [])):
+                    specialization_metrics[f"eval/i_spec_labeled_layer_{i}"] = v
+                for i, v in enumerate(i_spec_labeled.get('h_expert_per_layer', [])):
+                    specialization_metrics[f"eval/h_expert_layer_{i}"] = v
+                for i, v in enumerate(i_spec_labeled.get('h_expert_given_domain_per_layer', [])):
+                    specialization_metrics[f"eval/h_expert_given_domain_layer_{i}"] = v
+                specialization_metrics["eval/h_domain"] = i_spec_labeled.get('h_domain', 0.0)
+                print0(f"  I_spec (labeled): {i_spec_labeled['i_spec_labeled_mean']:.4f}")
+            except Exception as e:
+                print0(f"  I_spec (labeled) failed: {e}")
 
-                try:
-                    val_loader_dead = build_val_loader()
-                    dead_result = compute_dead_experts(orig_model, val_loader_dead, device)
-                    milestone_metrics["eval/dead_expert_count"] = dead_result['total_dead_count']
-                    if dead_result['total_dead_count'] > 0:
-                        print0(f"  WARNING: {dead_result['total_dead_count']} dead experts detected!")
-                    else:
-                        print0(f"  No dead experts")
-                except Exception as e:
-                    print0(f"  Dead expert check failed: {e}")
+            # 2. Cluster-based I_spec (SECONDARY — representation-based)
+            try:
+                val_loader_ispec = build_val_loader()
+                i_spec_cluster = compute_i_spec(orig_model, val_loader_ispec, device,
+                                                n_experts=config.moe.n_routed_experts)
+                specialization_metrics["eval/i_spec_cluster_mean"] = i_spec_cluster['i_spec_mean']
+                for i, v in enumerate(i_spec_cluster.get('i_spec_per_layer', [])):
+                    specialization_metrics[f"eval/i_spec_cluster_layer_{i}"] = v
+                print0(f"  I_spec (cluster): {i_spec_cluster['i_spec_mean']:.4f}")
+            except Exception as e:
+                print0(f"  I_spec (cluster) failed: {e}")
 
-                try:
-                    domain_bpb = compute_domain_bpb(orig_model, tokenizer, device)
-                    for domain, bpb in domain_bpb.items():
-                        milestone_metrics[f"eval/domain_bpb/{domain}"] = bpb
-                    print0(f"  Domain BPB: { {k: f'{v:.3f}' for k, v in domain_bpb.items()} }")
-                except Exception as e:
-                    print0(f"  Domain BPB failed: {e}")
+            # 3. Dead expert detection
+            try:
+                val_loader_dead = build_val_loader()
+                dead_result = compute_dead_experts(orig_model, val_loader_dead, device)
+                specialization_metrics["eval/dead_expert_count"] = dead_result['total_dead_count']
+                if dead_result['total_dead_count'] > 0:
+                    print0(f"  WARNING: {dead_result['total_dead_count']} dead experts detected!")
+                else:
+                    print0(f"  No dead experts")
+            except Exception as e:
+                print0(f"  Dead expert check failed: {e}")
 
-            # ─── MTP acceptance rate every 2000 steps (RULE 9) ───
+            # 4. Per-domain BPB
+            try:
+                domain_bpb = compute_domain_bpb(orig_model, tokenizer, device,
+                                                 domain_texts=_domain_eval_texts)
+                for domain, bpb in domain_bpb.items():
+                    specialization_metrics[f"eval/domain_bpb/{domain}"] = bpb
+                print0(f"  Domain BPB: { {k: f'{v:.3f}' for k, v in domain_bpb.items()} }")
+            except Exception as e:
+                print0(f"  Domain BPB failed: {e}")
+
+            # 5. MTP acceptance rate (every eval_every, not every 2000)
             mtp_metrics = {}
-            if step > 0 and step % 2000 == 0:
-                try:
-                    val_loader_mtp = build_val_loader()
-                    mtp_result = compute_mtp_acceptance_rate(orig_model, val_loader_mtp, device)
-                    mtp_metrics["eval/mtp_acceptance_rate"] = mtp_result['acceptance_rate']
-                    for pos, rate in mtp_result.get('per_position_rates', {}).items():
-                        mtp_metrics[f"eval/mtp_pos_{pos}"] = rate
-                    print0(f"  MTP acceptance: {mtp_result['acceptance_rate']:.1%}")
-                except Exception as e:
-                    print0(f"  MTP acceptance failed: {e}")
+            if step > 0:
+                if args.no_mtp:
+                    mtp_metrics["eval/mtp_acceptance_rate"] = float('nan')
+                else:
+                    try:
+                        val_loader_mtp = build_val_loader()
+                        mtp_result = compute_mtp_acceptance_rate(orig_model, val_loader_mtp, device)
+                        mtp_metrics["eval/mtp_acceptance_rate"] = mtp_result['acceptance_rate']
+                        for pos, rate in mtp_result.get('per_position_rates', {}).items():
+                            mtp_metrics[f"eval/mtp_pos_{pos}"] = rate
+                        print0(f"  MTP acceptance: {mtp_result['acceptance_rate']:.1%}")
+                    except Exception as e:
+                        print0(f"  MTP acceptance failed: {e}")
 
-        # Restore FP8 modules after evaluation completes
-        if _fp8_ctx is not None:
-            _fp8_ctx.__exit__(None, None, None)
-            _fp8_ctx = None
+            # 6. Per-layer routing entropy (Masterplan §V)
+            load_stats = orig_model.get_expert_load_stats()
+            load_per_expert = load_stats['load_per_expert']  # [E]
+            per_layer_stats = load_stats.get('per_layer', {})
+            for layer_idx, layer_data in per_layer_stats.items():
+                h_load_layer = layer_data.get('H_load', None)
+                if h_load_layer is not None:
+                    specialization_metrics[f"eval/routing_entropy_layer_{layer_idx}"] = h_load_layer.item()
 
         # model.train() OUTSIDE the EMA context manager
         model.train()
@@ -1592,15 +1317,13 @@ while True:
 
         flops_so_far = num_flops_per_token * tokens_processed
         # Log expert load histogram at eval frequency (not every step — 64 values)
-        load_stats = orig_model.get_expert_load_stats()
-        load_per_expert = load_stats['load_per_expert']  # [E]
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "ema_val/bpb": ema_val_bpb,
             "moe/load_per_expert": wandb.Histogram(load_per_expert.cpu().numpy()),
-            **milestone_metrics,
+            **specialization_metrics,
             **mtp_metrics,
         })
 
@@ -1626,7 +1349,6 @@ while True:
                 "smooth_train_loss": smooth_train_loss,
                 "total_training_time": total_training_time,
             },
-            "health_monitor_state": health_monitor.state_dict(),
         }
 
         # Save model + optimizer + EMA atomically (all or nothing per file)
@@ -1671,32 +1393,9 @@ while True:
     )
     current_batch_tokens = world_tokens_per_fwdbwd * current_accum
 
-    # ─── Profiling: early exit after profiled steps ───
-    if args.profile and step > 5 + args.profile_steps:
-        print0(f"\nProfile complete ({args.profile_steps} steps profiled).")
-        print0("View with: nsys-ui <file>.nsys-rep  |  ncu-ui <file>.ncu-rep")
-        break
-
     synchronize()
     t0 = time.time()
 
-    # ─── Phase timing: CUDA events for zero-overhead measurement ───
-    # Why CUDA events instead of synchronize() + time.time()?
-    #   synchronize() BLOCKS the CPU until GPU finishes → breaks pipeline overlap
-    #   CUDA events record timestamps on the GPU timeline → no stall
-    #   Events are resolved lazily when we call elapsed_time() after the step
-    #
-    # We only resolve timing once per training step (after the final sync),
-    # NOT inside the micro-step loop. This preserves full CPU/GPU overlap.
-    _use_cuda_events = (device_type == "cuda")
-    if _use_cuda_events:
-        _evt_step_start = torch.cuda.Event(enable_timing=True)
-        _evt_fwd_start = torch.cuda.Event(enable_timing=True)
-        _evt_fwd_end = torch.cuda.Event(enable_timing=True)
-        _evt_bwd_end = torch.cuda.Event(enable_timing=True)
-        _evt_step_start.record()
-    dt_fwd = 0.0
-    dt_bwd = 0.0
     dt_data = 0.0
 
     # ─── Micro-step accumulation loop ───
@@ -1722,10 +1421,6 @@ while True:
         # autocast: run forward pass in bf16 for 2x memory savings + 2x faster matmuls
         # Without this, model runs in fp32 and CastLinear does nothing useful.
         # Loss computation stays in fp32 (cross_entropy promotes automatically).
-        if _use_cuda_events:
-            _evt_fwd_start.record()
-        if args.profile:
-            _model_module._nvtx_push(f"forward/micro{micro_step}")
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type == "cuda")):
             mtp_lambda = get_mtp_loss_weight(
                 tokens_processed, config.total_tokens,
@@ -1739,11 +1434,6 @@ while True:
                 mtp_lambda=mtp_lambda,
             )
             loss = outputs['loss']
-        if args.profile:
-            _model_module._nvtx_pop()
-        if _use_cuda_events:
-            _evt_fwd_end.record()
-
         train_loss_accum += loss.detach()
         main_loss_accum += outputs['main_loss'].detach()
         mtp_loss_accum += outputs['mtp_loss'].detach()
@@ -1752,26 +1442,12 @@ while True:
         # Scale loss for gradient accumulation
         # Each .backward() ADDS to .grad -> divide by accum count
         loss = loss / current_accum
-        if args.profile:
-            _model_module._nvtx_push(f"backward/micro{micro_step}")
         loss.backward()
-        if args.profile:
-            _model_module._nvtx_pop()
-        if _use_cuda_events:
-            _evt_bwd_end.record()
 
         # Prefetch next batch while the GPU is busy with backward
         _t_data_start = time.time()
         x, y, dataloader_state_dict = next(train_loader)
         dt_data += time.time() - _t_data_start
-
-        # Accumulate CUDA event timings (resolved lazily — no sync here)
-        if _use_cuda_events:
-            # Events are only resolved after the step's final synchronize().
-            # We accumulate the event pairs; timing is read after sync below.
-            # For multi-micro-step, we only keep the LAST micro-step's events
-            # (fine for profiling — the variance across micro-steps is tiny).
-            pass
 
     # Average losses across all micro-steps for accurate logging
     train_loss = train_loss_accum / current_accum
@@ -1783,14 +1459,6 @@ while True:
     # EVERYTHING BELOW IS OUTSIDE THE MICRO-STEP LOOP
     # One optimizer step per training step, not per micro-step
     # ═══════════════════════════════════════════════════════════
-
-    # ─── Bad batch injection (ablation stab-F) ───
-    # Simulate a gradient spike by scaling all gradients 10×
-    if args.inject_bad_batch >= 0 and step == args.inject_bad_batch:
-        print0(f"ABLATION: Injecting 10x gradient spike at step {step}")
-        for p in orig_model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(10.0)
 
     # ─── Per-group gradient norms (before clipping) ───
     # Computed pre-clip so we see the true gradient landscape.
@@ -1806,7 +1474,7 @@ while True:
     # producing different clip factors → inconsistent post-average gradients.
     # distributed_clip_grad_norm_ all-reduces squared norms first so all ranks
     # use the SAME clip factor (conservative upper bound via Cauchy-Schwarz).
-    clip_norm = float('inf') if args.no_grad_clip else config.max_grad_norm
+    clip_norm = config.max_grad_norm
     if ddp:
         grad_norm = distributed_clip_grad_norm_(orig_model.parameters(), max_norm=clip_norm)
     else:
@@ -1822,18 +1490,8 @@ while True:
             group["momentum"] = muon_momentum
 
     # Step the optimizer
-    if _use_cuda_events:
-        _evt_opt_start = torch.cuda.Event(enable_timing=True)
-        _evt_opt_end = torch.cuda.Event(enable_timing=True)
-        _evt_opt_start.record()
-    if args.profile:
-        _model_module._nvtx_push("optimizer")
     optimizer.step()
     model.zero_grad(set_to_none=True)
-    if args.profile:
-        _model_module._nvtx_pop()
-    if _use_cuda_events:
-        _evt_opt_end.record()
 
     # ─── MoE load-balance bias update (Difference #6) ───
     # This is the aux-loss-free balancing mechanism from DeepSeek V3.
@@ -1852,18 +1510,9 @@ while True:
 
     # ─── Timing ───
     train_loss_f = train_loss.item()
-    synchronize()  # single sync per step — resolves all pending CUDA events
+    synchronize()
     t1 = time.time()
     dt = t1 - t0
-
-    # Resolve CUDA event timings (zero overhead — events already recorded on GPU)
-    if _use_cuda_events:
-        dt_fwd = _evt_fwd_start.elapsed_time(_evt_fwd_end) / 1000  # ms → s
-        dt_bwd = _evt_fwd_end.elapsed_time(_evt_bwd_end) / 1000
-        dt_opt = _evt_opt_start.elapsed_time(_evt_opt_end) / 1000
-    else:
-        # CPU fallback: dt_fwd/dt_bwd are 0, dt_opt = 0
-        dt_opt = 0.0
 
     if step > 10:
         total_training_time += dt
@@ -1876,38 +1525,19 @@ while True:
     # Compute throughput HERE so health monitor gets this step's value, not last step's
     tok_per_sec = int(current_batch_tokens / dt) if dt > 0 else 0
 
-    # ─── Health monitor (automated tripwires) ───
-    alerts = health_monitor.update(step, grad_norm, train_loss_f, H_load, tok_per_sec)
-    for severity, msg in alerts:
-        print0(f"  [{severity}] {msg}")
-    if alerts and not use_dummy_wandb:
-        n_critical = sum(1 for s, _ in alerts if s == "CRITICAL")
-        n_warning = sum(1 for s, _ in alerts if s == "WARNING")
-        wandb_run.log({
-            "health/critical_alerts": n_critical,
-            "health/warning_alerts": n_warning,
-            "step": step,
-        })
-
-    # ─── NaN abort: halt training after consecutive NaN/Inf ───
-    # Why halt instead of auto-rollback? If the NaN was caused by bad data,
-    # rolling back would re-encounter the same data and loop forever.
-    # If it was a gradient spike, the user should inspect the cause.
-    # DeepSeek V3 had zero rollbacks because they prevented divergence.
-    # We halt early so the user can diagnose and resume from last checkpoint.
-    MAX_CONSECUTIVE_NAN = 3
-    if health_monitor.nan_count >= MAX_CONSECUTIVE_NAN:
-        print0(f"\n{'='*70}")
-        print0(f"  TRAINING HALTED: {health_monitor.nan_count} consecutive NaN/Inf detected")
-        print0(f"  Last good checkpoint: {checkpoint_dir}")
-        print0(f"  To resume: add --resume-from-step 0 (loads latest checkpoint)")
-        print0(f"  Diagnosis: check grad_norm/ logs in W&B for which group diverged")
-        print0(f"{'='*70}\n")
-        wandb_run.log({"health/nan_halt": 1, "step": step})
-        wandb_run.finish()
-        compute_cleanup()
-        import sys
-        sys.exit(1)
+    # ─── NaN/Inf check ───
+    if not math.isfinite(train_loss_f):
+        _nan_count += 1
+        print0(f"  [CRITICAL] NaN/Inf loss at step {step} (count: {_nan_count})")
+        if _nan_count >= 3:
+            print0(f"TRAINING HALTED: {_nan_count} consecutive NaN/Inf. "
+                   f"Resume from: {checkpoint_dir}")
+            wandb_run.finish()
+            compute_cleanup()
+            import sys
+            sys.exit(1)
+    else:
+        _nan_count = 0
 
     # ─── Logging ───
     ema_beta = 0.9
@@ -1918,69 +1548,17 @@ while True:
     flops_per_sec = num_flops_per_token * current_batch_tokens / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
 
-    # Phase timing: dt_misc captures EMA, load-balance bias, grad clip, LR update
-    dt_misc = max(0.0, dt - dt_fwd - dt_bwd - dt_opt - dt_data)
-    data_stall_pct = 100 * dt_data / max(dt, 1e-9)
-
-    # ─── Cost accounting ───
-    # At $0.79/GPU-hr (A6000) or $2.49/GPU-hr (H100), knowing cumulative spend
-    # and projected total lets you kill bad runs early. A run that's 30% done with
-    # no loss improvement and $50 spent should be stopped, not continued to $170.
-    cost_metrics = {}
-    if args.cost_per_gpu_hour > 0 and total_training_time > 0:
-        gpu_hours_so_far = (total_training_time / 3600) * ddp_world_size
-        cost_so_far = gpu_hours_so_far * args.cost_per_gpu_hour
-        cost_per_token = cost_so_far / max(tokens_processed, 1)
-        # Project total cost from current throughput
-        steps_remaining = max(num_iterations - step, 0)
-        avg_step_time = total_training_time / max(step - 10, 1)  # exclude first 10 steps
-        eta_seconds = steps_remaining * avg_step_time
-        eta_gpu_hours = (eta_seconds / 3600) * ddp_world_size
-        estimated_total_cost = cost_so_far + eta_gpu_hours * args.cost_per_gpu_hour
-        cost_metrics = {
-            "cost/cumulative_usd": cost_so_far,
-            "cost/per_billion_tokens": cost_per_token * 1e9,
-            "cost/estimated_total_usd": estimated_total_cost,
-            "cost/gpu_hours": gpu_hours_so_far,
-            "cost/eta_hours": eta_seconds / 3600,
-        }
-
     pct_done = 100 * step / num_iterations
-    # Build cost suffix for print line
-    _cost_str = ""
-    if cost_metrics:
-        _cost_str = (f" | ${cost_metrics['cost/cumulative_usd']:.2f}/"
-                     f"${cost_metrics['cost/estimated_total_usd']:.1f} "
-                     f"ETA:{cost_metrics['cost/eta_hours']:.1f}h")
     print0(
         f"step {step:05d}/{num_iterations} ({pct_done:.1f}%) | "
         f"loss: {debiased_loss:.4f} (main:{main_loss_avg.item():.4f} mtp:{mtp_loss_avg.item():.4f} aux:{aux_loss_avg.item():.6f}) | "
         f"H_load: {H_load:.2f} | "
         f"lr×: {lrm:.3f} | γ: {gamma:.4f} | "
         f"grad: {grad_norm:.2f} | "
-        f"dt: {dt:.2f}s (fwd:{dt_fwd:.2f} bwd:{dt_bwd:.2f} opt:{dt_opt:.2f} data:{dt_data:.2f}) | "
+        f"dt: {dt:.2f}s (data:{dt_data:.2f}) | "
         f"mfu: {mfu:.1f}% | "
         f"tok/s: {tok_per_sec:,}"
-        f"{_cost_str}"
     )
-    if data_stall_pct > 5.0 and step > 5:
-        print0(f"  [WARNING] Data loading is {data_stall_pct:.1f}% of step time — "
-               f"GPUs are idle. Consider more dataloader workers or faster storage.")
-
-    # ─── Compile time check (step 0 includes torch.compile kernel generation) ───
-    if step == 0 and '_compile_start_time' in dir():
-        compile_elapsed = (time.time() - _compile_start_time) / 60
-        if compile_elapsed > COMPILE_TIMEOUT_MINUTES:
-            print0(f"  [CRITICAL] torch.compile took {compile_elapsed:.1f} min "
-                   f"(limit: {COMPILE_TIMEOUT_MINUTES} min). This usually means:")
-            print0(f"    - PyTorch doesn't support your GPU architecture")
-            print0(f"    - CUDA version mismatch")
-            print0(f"    - Try: TORCH_COMPILE_DISABLE=1 or upgrade PyTorch")
-        elif compile_elapsed > 5:
-            print0(f"  [INFO] torch.compile took {compile_elapsed:.1f} min "
-                   f"(normal: 1-5 min first run, <30s cached)")
-        else:
-            print0(f"  [INFO] torch.compile: {compile_elapsed:.1f} min (OK)")
 
     if step % config.log_every_steps == 0:
         # ─── Collect per-group LRs (verify muP scaling is correct) ───
@@ -2001,7 +1579,7 @@ while True:
         wandb_run.log({
             "step": step,
             "tokens_processed": tokens_processed,
-            # ─── Loss breakdown (detect MTP vs LM issues separately) ───
+            # ─── Loss breakdown ───
             "train/loss": debiased_loss,
             "train/loss_raw": train_loss_f,
             "train/main_loss": main_loss_avg.item(),
@@ -2012,12 +1590,6 @@ while True:
             "train/lr_multiplier": lrm,
             "train/grad_norm": grad_norm.item(),
             "train/step_time_s": dt,
-            "train/dt_fwd": dt_fwd,
-            "train/dt_bwd": dt_bwd,
-            "train/dt_opt": dt_opt,
-            "train/dt_data": dt_data,
-            "train/dt_misc": dt_misc,
-            "train/data_stall_pct": data_stall_pct,
             # ─── MoE health ───
             "train/H_load": H_load,
             "train/gamma": gamma,
@@ -2027,16 +1599,8 @@ while True:
             "train/batch_tokens": current_batch_tokens,
             # ─── FIM (RULE 6) ───
             "train/fim_fraction": dataloader_state_dict.get("fim_fraction", 0.0),
-            # ─── Health monitor (tripwire internals) ───
-            "health/grad_norm_ema": health_monitor.grad_norm_ema,
-            "health/loss_ema": health_monitor.loss_ema,
-            "health/throughput_ema": health_monitor.throughput_ema,
-            "health/grad_spikes_last_100": len(health_monitor.grad_spikes_last_100),
-            "health/loss_spikes_last_100": len(health_monitor.loss_spikes_last_100),
             # ─── Per-group gradient norms (pre-clip) ───
             **{f"grad_norm/{k}": v for k, v in per_group_gn.items()},
-            # ─── Cost accounting ───
-            **cost_metrics,
             # ─── Per-group LRs + memory ───
             **group_lrs,
             **mem_stats,
