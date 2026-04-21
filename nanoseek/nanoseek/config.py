@@ -27,15 +27,46 @@ DEEPSEEK_KV_LORA_RATIO = 0.070    # kv_lora_rank / hidden_size
 
 # FFN ratios
 DEEPSEEK_DENSE_FFN_RATIO = 2.56   # intermediate_size / hidden_size for dense layers
-DEEPSEEK_MOE_INTER_RATIO = 0.375  # moe_intermediate_size / hidden_size (G~29, Krajewski)
+
+# MoE intermediate size ratio — NANO SCALE ADJUSTMENT
+#
+# Conservation law: N_experts × MOE_INTER_RATIO = constant (preserves total params + active FLOPs)
+#   DeepSeek V3 original (7168h, 671B total): 64 × 0.375 = 24
+#   NanoSeek nano scale  (768-2048h, ≤5B total): 16 × 1.5 = 24  ← same product
+#
+# WHY we change from 64→16 experts with 0.375→1.5 inter ratio at nano scale:
+#
+# 1. Expert capacity: V3's 0.375 ratio gives 29-token FFN width at 7168h. At 768h that's
+#    only 288 tokens — too narrow for experts to learn distinct specializations.
+#    With ratio=1.5: 1152 at 768h (matches dense sublayer), 7.4M params per expert at 1280h.
+#
+# 2. Statistical efficiency: 64 experts needs ~16K tokens/step to see each expert ~250 times.
+#    16 experts needs only ~4K tokens/step. Our seq_len=4096, batch=128 → 512K tokens/step.
+#    Both are fine, but 16 experts have 4× better gradient signal per expert.
+#
+# 3. Routing collapse risk: With 64 experts top-8 at nano scale, routing entropy collapses
+#    faster (less capacity per expert → experts can't differentiate → all load on winners).
+#    16 experts top-2 is sparser (12.5% = same) but each expert has 4× more capacity to
+#    learn a niche before becoming overloaded.
+#
+# 4. sparsity ratio: 2/16 = 8/64 = 12.5% — IDENTICAL. Active FLOPs unchanged.
+#
+# Reference: Krajewski et al. 2024 (MoE granularity scaling) shows expert capacity per param
+# should scale ~linearly with model size; keeping V3's ratio at nano scale under-provisions experts.
+DEEPSEEK_MOE_INTER_RATIO = 1.5    # Nano-scale adjusted (V3 original was 0.375 at 7168h)
+DEEPSEEK_V3_MOE_INTER_RATIO = 0.375  # V3 original — kept for reference / future 7B+ scales
 
 # MoE topology constants (promoted from MoEConfig)
-N_ROUTED_EXPERTS = 64              # Total routed experts
-NUM_EXPERTS_PER_TOK = 8            # Active experts per token (top-k)
-N_SHARED_EXPERTS = 2               # Always-active shared experts
-N_GROUP = 8                        # Expert groups for routing
-TOPK_GROUP = 4                     # Route to half the groups
-ROUTED_SCALING_FACTOR = 2.5        # DeepSeek V3 empirical value
+# Nano-scale: 16 experts top-2 (was 64/8 at V3 7168h scale)
+# Group routing: N_GROUP=4, TOPK_GROUP=4 → all groups always selected → pure top-k routing.
+# This disables EP-style group constraint which is only beneficial with expert parallelism
+# across ≥8 GPUs. At nano scale (1-8 GPUs), pure top-k is simpler and more stable.
+N_ROUTED_EXPERTS = 16              # Nano scale (V3: 64)
+NUM_EXPERTS_PER_TOK = 2            # Active experts per token — top-k (V3: 8, ratio same: 2/16=8/64=12.5%)
+N_SHARED_EXPERTS = 2               # Always-active shared experts (unchanged)
+N_GROUP = 4                        # Expert groups (V3: 8; TOPK_GROUP=N_GROUP → pure top-k, no EP constraint)
+TOPK_GROUP = 4                     # All groups selected (V3: 4; =N_GROUP here disables group gating)
+ROUTED_SCALING_FACTOR = 2.5        # DeepSeek V3 empirical value — kept (scale-invariant normalization factor)
 
 # Training constants
 DEEPSEEK_GAMMA = 0.001             # Load balancing bias update rate
@@ -48,18 +79,6 @@ DEEPSEEK_MTP_LAMBDA_INITIAL = 0.3     # Early training MTP weight
 DEEPSEEK_MTP_LAMBDA_FINAL = 0.1       # Late training MTP weight
 DEEPSEEK_MTP_TRANSITION_RATIO = 0.60  # Switch at 60% of training
 DEEPSEEK_MTP_LOSS_DECAY = 0.8         # Weight decay for deeper predictions
-
-
-# ============================================================================
-# Standalone helpers
-# ============================================================================
-
-def get_mtp_loss_weight(tokens_processed: int, total_tokens: int) -> float:
-    """Compute MTP loss weight at current training progress."""
-    progress = tokens_processed / total_tokens if total_tokens > 0 else 0.0
-    if progress < DEEPSEEK_MTP_TRANSITION_RATIO:
-        return DEEPSEEK_MTP_LAMBDA_INITIAL
-    return DEEPSEEK_MTP_LAMBDA_FINAL
 
 
 # ============================================================================
@@ -116,6 +135,10 @@ class NanoSeekConfig:
     disable_shared_experts: bool = False
     num_mtp_modules: int = 1
     seq_aux_loss_alpha: float = 0.0001
+    # When True: aux loss has gradient (Switch-Transformer style, --aux-loss-type classic).
+    # When False (default): aux loss is monitoring-only, zero gradient (bias mode).
+    use_classic_aux_loss: bool = False
+    routed_scaling_factor: float = ROUTED_SCALING_FACTOR
     scoring_func: str = "sigmoid"
     norm_topk_prob: bool = True
 
@@ -238,11 +261,12 @@ class NanoSeekConfig:
             n_group=self.n_group,
             topk_group=self.topk_group,
             scoring_func=self.scoring_func,
-            routed_scaling_factor=ROUTED_SCALING_FACTOR,
+            routed_scaling_factor=self.routed_scaling_factor,
             norm_topk_prob=self.norm_topk_prob,
             gamma=DEEPSEEK_GAMMA,
             gamma_freeze_ratio=DEEPSEEK_GAMMA_FREEZE_RATIO,
             seq_aux_loss_alpha=self.seq_aux_loss_alpha,
+            use_classic_aux_loss=self.use_classic_aux_loss,
             first_k_dense_replace=self.first_k_dense_replace,
             disable_shared_experts=self.disable_shared_experts,
             experts_per_group=self.n_routed_experts // self.n_group,

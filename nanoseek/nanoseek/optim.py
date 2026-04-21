@@ -262,10 +262,17 @@ class MuonAdamW(torch.optim.Optimizer):
             state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
         momentum_buffer = state["momentum_buffer"]
 
-        # Second momentum buffer is factored, either per-row or per-column
+        # Second momentum buffer is factored, either per-row or per-column.
+        # For 2D params (H, D) stacked to (N, H, D): buffer is (N, H, 1) or (N, 1, D).
+        # For 3D params (E, H, D) stacked to (N, E, H, D): buffer is (N, E, H, 1) or (N, E, 1, D).
+        # General: (num_params, *shape) with the reduction dim set to 1.
         if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            state_list = [num_params] + list(shape)
+            if shape[-2] >= shape[-1]:
+                state_list[-1] = 1   # reduce over last dim
+            else:
+                state_list[-2] = 1   # reduce over second-to-last dim
+            state["second_momentum_buffer"] = torch.zeros(state_list, dtype=dtype, device=device)
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
@@ -437,6 +444,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
             if pinfo['is_small']:
                 p_slice = p # <- Operate on full param (REPLICATED)
+                if not state:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p)
+                    state['exp_avg_sq'] = torch.zeros_like(p)
             else:
                 rank_size = p.shape[0] // world_size
                 p_slice = p[rank * rank_size:(rank + 1) * rank_size] # <- Operate on slice (SHARDED)
@@ -487,8 +498,12 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            state_list = [chunk_size] + list(shape)
+            if shape[-2] >= shape[-1]:
+                state_list[-1] = 1
+            else:
+                state_list[-2] = 1
+            state["second_momentum_buffer"] = torch.zeros(state_list, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
         # Build output buffer for all_gather

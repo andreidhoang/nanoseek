@@ -281,7 +281,8 @@ class MultiHeadLatentAttention(nn.Module):
             mask = torch.full((max_dim, max_dim), float("-inf"), device=device, dtype=dtype)
             mask = mask.triu_(diagonal=1)
             self._cached_causal_mask = mask
-        return self._cached_causal_mask[:seq_len, :kv_len]
+        cached_len = kv_len - seq_len
+        return self._cached_causal_mask[cached_len : cached_len + seq_len, :kv_len]
 
     # =========================================================================
     # Cache Helpers
@@ -545,6 +546,7 @@ class Gate(nn.Module):
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 2.5,
         seq_aux_loss_alpha: float = 0.0001,
+        use_classic_aux_loss: bool = False,
     ):
         super().__init__()
         self.n_routed_experts = n_routed_experts
@@ -556,6 +558,10 @@ class Gate(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
         self.seq_aux_loss_alpha = seq_aux_loss_alpha
+        # Classic mode: Switch-Transformer-style differentiable aux loss.
+        # When False (default): seq_aux_loss_alpha is monitoring-only (detached).
+        # When True: aux loss has gradient through soft probabilities P_i.
+        self.use_classic_aux_loss = use_classic_aux_loss
 
         # Router projection: hidden_dim → n_routed_experts
         self.router_weight = CastLinear(hidden_dim, n_routed_experts, bias=False)
@@ -614,28 +620,49 @@ class Gate(nn.Module):
 
         # STEP 6: BUG FIX #2 — normalize top-k probabilities
         if self.norm_topk_prob:
-            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-10)
 
         # STEP 7: Apply routed_scaling_factor (DeepSeek V3 pattern: scale weights, not output)
         weights = weights * self.routed_scaling_factor
 
         # STEP 8: Compute auxiliary loss and metadata
-        one_hot = torch.zeros(N, E, device=device, dtype=scores.dtype)
-        one_hot.scatter_(1, indices, 1.0)
-        load_counts = one_hot.sum(dim=0)  # [E]
+        # bincount is O(N) memory vs one-hot scatter O(N*E); result is identical.
+        load_counts = torch.bincount(indices.view(-1), minlength=E).to(scores.dtype)
 
-        # Sequence-level aux loss: L = alpha * mean((f_i - 1/E)^2)
-        f = load_counts / max(N, 1)
-        target = 1.0 / E
-        aux_loss = self.seq_aux_loss_alpha * ((f - target) ** 2).mean()
+        # Two aux_loss modes controlled by self.use_classic_aux_loss:
+        #
+        # BIAS MODE (default, use_classic_aux_loss=False):
+        #   Monitoring-only MSE loss. Gradient = 0 (intentional).
+        #   load_counts comes from bincount(topk()) — discrete, non-differentiable.
+        #   Load balancing happens entirely via update_bias() in the training loop.
+        #   This is the DeepSeek V3 "auxiliary-loss-free" design.
+        #
+        # CLASSIC MODE (use_classic_aux_loss=True, --aux-loss-type classic):
+        #   Switch-Transformer-style differentiable aux loss (Fedus et al., 2022).
+        #   Gradient flows through P_i = sigmoid(logits).mean(dim=0).
+        #   f_i (hard fraction) is detached; P_i (soft probability) is not.
+        #   This is the correct ablation baseline when comparing bias vs. classic.
+        f = load_counts / max(N * K, 1)  # hard routing fraction per expert
+
+        if self.seq_aux_loss_alpha > 0.0 and self.use_classic_aux_loss:
+            # Classic differentiable load balancing (Switch Transformer Eq. 4).
+            # P_i has gradient through: sigmoid(router_weight @ x) → mean over tokens.
+            # f_i is detached: routing fractions come from discrete topk(), no grad.
+            P_i = scores.mean(dim=0)  # [E] soft selection probabilities, has gradient
+            f_hard = f.detach()       # [E] hard routing fractions, no gradient
+            aux_loss = self.seq_aux_loss_alpha * E * (f_hard * P_i).sum()
+        elif self.seq_aux_loss_alpha > 0.0:
+            # Bias mode: MSE monitoring loss. Zero gradient — purely diagnostic.
+            target = 1.0 / E
+            aux_loss = (self.seq_aux_loss_alpha * ((f - target) ** 2).mean()).detach()
+        else:
+            aux_loss = torch.tensor(0.0, device=device, dtype=scores.dtype)
 
         # Load balance entropy in bits for monitoring (H_load → higher = more balanced)
-        # For 64 experts with uniform routing: max H_load = log2(64) = 6 bits
+        # For 16 experts with uniform routing: max H_load = log2(16) = 4 bits (nano scale)
         # Alert threshold: H_load < 2.0 bits indicates routing collapse
-        # Normalize f to a proper probability distribution (f sums to K, not 1,
-        # because each token is counted K times across its top-K expert slots)
-        p = f / (f.sum() + 1e-10)
-        p_safe = p + 1e-10
+        # f already sums to 1.0 (divided by N*K above), so p = f (safe add epsilon only)
+        p_safe = f + 1e-10
         H_load = -(p_safe * p_safe.log2()).sum()
 
         metadata = {
@@ -667,26 +694,32 @@ class MoE(nn.Module):
 
     Components:
     - Gate (router): sigmoid scoring + group routing + bias balancing
-    - Routed experts: 64 SwiGLU FFNs, top-8 selected per token
+    - Routed experts: 16 SwiGLU FFNs stored as native 3D weight tensors (nano scale)
     - Shared expert: 1 SwiGLU MLP with combined inter_dim (n_shared * moe_inter_dim)
       Applied to ALL tokens unconditionally (captures common patterns)
 
-    Token-centric dispatch: iterate over experts, process each expert's batch.
+    Expert weights are stored as 3D Parameters in grouped_mm-friendly [E, in, out] layout
+    (note: OPPOSITE of nn.Linear's [out, in] convention). This matches torch._grouped_mm's
+    expectation that B[e] multiplies A_e on the right: A_e @ B[e] = [cnt_e, in] @ [in, out].
+    Eliminates per-forward transpose+copy overhead vs ModuleList. Enables torch.compile fusion.
+
+    Token-centric dispatch: sort tokens by expert for coalesced access.
     """
 
     def __init__(
         self,
         hidden_dim: int,
         moe_inter_dim: int,
-        n_routed_experts: int = 64,
-        num_experts_per_tok: int = 8,
+        n_routed_experts: int = 16,
+        num_experts_per_tok: int = 2,
         n_shared_experts: int = 2,
-        n_group: int = 8,
+        n_group: int = 4,
         topk_group: int = 4,
         scoring_func: str = "sigmoid",
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 2.5,
         seq_aux_loss_alpha: float = 0.0001,
+        use_classic_aux_loss: bool = False,
         shared_inter_dim: Optional[int] = None,
         disable_shared_experts: bool = False,
     ):
@@ -706,47 +739,81 @@ class MoE(nn.Module):
             norm_topk_prob=norm_topk_prob,
             routed_scaling_factor=routed_scaling_factor,
             seq_aux_loss_alpha=seq_aux_loss_alpha,
+            use_classic_aux_loss=use_classic_aux_loss,
         )
 
-        # Routed experts (sparse, selected per token)
-        self.routed_experts = nn.ModuleList(
-            [Expert(hidden_dim, moe_inter_dim) for _ in range(n_routed_experts)]
-        )
+        # Routed experts — native 3D weight tensors stored in compute-optimal layout.
+        # Layout is chosen to eliminate per-forward transpose+copy overhead in the
+        # grouped GEMM fast path (the GPU training hot path).
+        #
+        # SwiGLU: output = W_down(SiLU(W_gate(x)) * W_up(x))
+        # w_gate/w_up: stored as [E, D, I] so grouped_mm(sorted_x[NK,D], W[E,D,I])
+        #              computes [NK, I] directly without transpose.
+        # w_down: stored as [E, I, D] so grouped_mm(hidden[NK,I], W[E,I,D])
+        #         computes [NK, D] directly without transpose.
+        #
+        # For F.linear compatibility in expert_forward, weights are used as .T:
+        #   F.linear(x, w_gate[e].T)  # w_gate[e] is [D,I], .T is [I,D] = [out,in]
+        self.w_gate = nn.Parameter(torch.empty(n_routed_experts, hidden_dim, moe_inter_dim))
+        self.w_up = nn.Parameter(torch.empty(n_routed_experts, hidden_dim, moe_inter_dim))
+        self.w_down = nn.Parameter(torch.empty(n_routed_experts, moe_inter_dim, hidden_dim))
 
-        # NOTE: Do NOT cache weight tensor references here (e.g., [e.w_gate.weight ...]).
-        # When constructing on meta device + to_empty(), cached refs become stale
-        # (point to meta tensors while actual params moved to cuda).
-        # Access via self.routed_experts[i].w_gate.weight in forward instead.
+        # Default init matching NanoSeekModel._init_weights for standalone use.
+        # NanoSeekModel._init_weights overrides this when used as part of the full model.
+        # Without init, torch.empty gives zeros on some platforms → zero output → broken tests.
+        std = 1.0 / (hidden_dim ** 0.5)
+        nn.init.normal_(self.w_gate, mean=0.0, std=std)
+        nn.init.normal_(self.w_up, mean=0.0, std=std)
+        nn.init.normal_(self.w_down, mean=0.0, std=0.006)
 
         # Shared expert (dense, always active) — single MLP with combined inter_dim
         # DeepSeek V3 pattern: n_shared_experts is a multiplier, not a count of modules
         effective_shared_dim = shared_inter_dim or (n_shared_experts * moe_inter_dim)
         self.shared_expert = Expert(hidden_dim, effective_shared_dim)
 
-    def _batched_expert_forward(
+    def expert_forward(self, expert_idx: int, x: Tensor) -> Tensor:
+        """Run a single routed expert on input. For tests and manual verification.
+
+        SwiGLU: output = W_down(SiLU(W_gate(x)) * W_up(x))
+
+        Weight layout: w_gate[e] is [D, I], so we pass .T to F.linear
+        to satisfy [out_features, in_features] convention.
+        """
+        dtype = x.dtype
+        return F.linear(
+            F.silu(F.linear(x, self.w_gate[expert_idx].T.to(dtype)))
+            * F.linear(x, self.w_up[expert_idx].T.to(dtype)),
+            self.w_down[expert_idx].T.to(dtype),
+        )
+
+    def _grouped_expert_forward(
+        self, sorted_x: Tensor, expert_boundaries: Tensor,
+    ) -> Tensor:
+        """CUDA fast path: exact variable-length expert dispatch via grouped GEMM.
+
+        torch._grouped_mm(A, B, offsets) computes A_e @ B_e per expert.
+        Weights are stored in [E, in, out] layout so no per-forward transpose
+        is needed — eliminating ~168MB of transient allocation per layer.
+        """
+        dtype = sorted_x.dtype
+        expert_offsets = expert_boundaries[1:].to(dtype=torch.int32)
+
+        # w_gate: [E, D, I], w_up: [E, D, I] → cat on last dim → [E, D, 2I]
+        # No transpose needed because weights are stored in grouped_mm-friendly layout.
+        w_gate_up = torch.cat([self.w_gate, self.w_up], dim=-1).to(dtype)
+
+        gate_up_out = torch._grouped_mm(sorted_x, w_gate_up, expert_offsets)
+        gate_out, up_out = gate_up_out.chunk(2, dim=-1)
+        hidden = F.silu(gate_out) * up_out
+
+        # w_down: [E, I, D] — already in correct layout for second grouped_mm
+        return torch._grouped_mm(hidden, self.w_down.to(dtype), expert_offsets)
+
+    def _padded_batched_expert_forward(
         self, sorted_x: Tensor, sorted_indices: Tensor,
         expert_counts: Tensor, expert_boundaries: Tensor,
     ) -> Tensor:
-        """Process all routed experts via batched matmul instead of sequential loop.
-
-        All 64 routed experts share identical weight shapes ([inter, D] for gate/up,
-        [D, inter] for down), so we can stack their weights into [E, *, *] tensors
-        and use torch.bmm to process all experts in 2 fused kernel launches instead
-        of 192 separate ones.
-
-        Uses a single torch.stack over pre-built weight list to minimize Python
-        overhead. torch.stack is differentiable — gradients flow back to each
-        individual expert's parameters. Padding with zeros is gradient-neutral.
-
-        Args:
-            sorted_x:           [N*K, D] tokens sorted by expert assignment
-            sorted_indices:     [N*K] which expert each token is assigned to (sorted)
-            expert_counts:      [E] number of tokens per expert
-            expert_boundaries:  [E+1] cumsum boundaries for each expert's slice
-
-        Returns:
-            sorted_output: [N*K, D] expert outputs in sorted order
-        """
+        """Fallback batched path for CPU/tests when grouped GEMM is unavailable."""
         E = self.n_routed_experts
         NK, D = sorted_x.shape
         dtype = sorted_x.dtype
@@ -754,12 +821,9 @@ class MoE(nn.Module):
         if NK == 0:
             return torch.zeros_like(sorted_x)
 
-        # ── Static pad size: avoids .item() and torch.compile recompilation ──
-        # With dynamic=False, NK and E are compile-time constants, so pad_size
-        # is also constant → no recompilation. 4x average gives huge margin
-        # (Binomial(N, K/E) has std ≈ √(NK/E), so max < mean + 10·std ≈ 1.2× avg).
-        # 4x handles even degenerate early-training routing.
-        pad_size = (NK + E - 1) // E * 8
+        pad_size = int(expert_counts.max().item())
+        if pad_size == 0:
+            return torch.zeros_like(sorted_x)
 
         position_in_expert = (
             torch.arange(NK, device=sorted_x.device) - expert_boundaries[sorted_indices]
@@ -767,26 +831,37 @@ class MoE(nn.Module):
         padded_input = sorted_x.new_zeros(E, pad_size, D)
         padded_input[sorted_indices, position_in_expert] = sorted_x
 
-        # ── Stack expert weights (inline access — no caching due to meta device) ──
-        # CastLinear stores weight as [out_features, in_features]:
-        #   w_gate.weight: [inter, D], w_up.weight: [inter, D], w_down.weight: [D, inter]
-        # Fuse gate+up into [E, 2*inter, D] via one torch.cat after two stacks
-        w_gate_up = torch.cat([
-            torch.stack([e.w_gate.weight for e in self.routed_experts]),  # [E, inter, D]
-            torch.stack([e.w_up.weight for e in self.routed_experts]),    # [E, inter, D]
-        ], dim=1).to(dtype)                                              # [E, 2*inter, D]
-        w_down = torch.stack([e.w_down.weight for e in self.routed_experts]).to(dtype)  # [E, D, inter]
+        # w_gate: [E, D, I], w_up: [E, D, I] → cat on last dim → [E, D, 2I]
+        # bmm needs [E, pad, D] @ [E, D, 2I] = [E, pad, 2I]
+        w_gate_up = torch.cat([self.w_gate, self.w_up], dim=-1).to(dtype)
+        gate_up_out = torch.bmm(padded_input, w_gate_up)  # [E, pad, 2I]
+        gate_out, up_out = gate_up_out.chunk(2, dim=-1)
+        hidden = F.silu(gate_out) * up_out
 
-        # ── Batched SwiGLU: 2 bmm calls instead of 192 individual matmuls ──
-        gate_up_out = torch.bmm(padded_input, w_gate_up.transpose(1, 2))  # [E, pad_size, 2*inter]
-        gate_out, up_out = gate_up_out.chunk(2, dim=-1)                   # each [E, pad_size, inter]
-        hidden = F.silu(gate_out) * up_out                                # [E, pad_size, inter]
-        out = torch.bmm(hidden, w_down.transpose(1, 2))                   # [E, pad_size, D]
+        # w_down: [E, I, D]
+        # bmm needs [E, pad, I] @ [E, I, D] = [E, pad, D]
+        out = torch.bmm(hidden, self.w_down.to(dtype))
+        return out[sorted_indices, position_in_expert]
 
-        # ── Vectorized unpad: gather valid outputs back to [N*K, D] ──
-        sorted_output = out[sorted_indices, position_in_expert]
+    def _batched_expert_forward(
+        self, sorted_x: Tensor, sorted_indices: Tensor,
+        expert_counts: Tensor, expert_boundaries: Tensor,
+    ) -> Tensor:
+        """Process routed experts without the old fixed 8x padding slab.
 
-        return sorted_output
+        On CUDA BF16 we use `torch._grouped_mm`, which handles variable per-expert
+        token counts directly from cumulative offsets. CPU and non-BF16 cases keep a
+        simpler exact-capacity fallback for testability.
+        """
+        if (
+            sorted_x.is_cuda
+            and sorted_x.dtype == torch.bfloat16
+            and hasattr(torch, "_grouped_mm")
+        ):
+            return self._grouped_expert_forward(sorted_x, expert_boundaries)
+        return self._padded_batched_expert_forward(
+            sorted_x, sorted_indices, expert_counts, expert_boundaries,
+        )
 
     def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Dict[str, Tensor]]:
         """Process tokens through routed + shared experts.
@@ -822,7 +897,8 @@ class MoE(nn.Module):
             x_expanded = x.unsqueeze(1).expand(-1, K, -1).reshape(N * K, D)  # [N*K, D]
 
             # Sort by expert index for contiguous memory access
-            sort_order = flat_indices.argsort(stable=True)
+            # stable=True is unnecessary for integer sorting and adds overhead.
+            sort_order = flat_indices.argsort()
             sorted_indices = flat_indices[sort_order]
             sorted_x = x_expanded[sort_order]         # [N*K, D]
             sorted_weights = flat_weights[sort_order]  # [N*K]
@@ -832,11 +908,10 @@ class MoE(nn.Module):
             expert_boundaries = torch.zeros(E + 1, dtype=torch.long, device=x.device)
             expert_boundaries[1:] = expert_counts.cumsum(0)
 
-        # ── Expert dispatch: batched (GPU) or sequential (CPU) ──
-        # Batched dispatch uses torch.bmm to process all experts in 2 kernel launches
-        # instead of 192 (64 experts × 3 matmuls). Always use batched on GPU —
-        # the static pad_size (4x average) avoids .item() and torch.compile
-        # recompilation while keeping padding overhead manageable.
+        # ── Expert dispatch: grouped GEMM (GPU) or sequential (CPU) ──
+        # The CUDA fast path uses grouped GEMM with exact per-expert offsets, which
+        # avoids the old E × pad_size × D activation slab. CPU keeps the sequential
+        # path because grouped_mm is CUDA-only and test workloads are small.
         use_batched = sorted_x.is_cuda and E >= 8
 
         with record_function("MoE::expert_compute"):
@@ -855,7 +930,7 @@ class MoE(nn.Module):
                     if cnt == 0:
                         continue
                     expert_input = sorted_x[offset:offset + cnt]
-                    sorted_output[offset:offset + cnt] = self.routed_experts[expert_idx](expert_input)
+                    sorted_output[offset:offset + cnt] = self.expert_forward(expert_idx, expert_input)
                     offset += cnt
 
         with record_function("MoE::combine"):
@@ -863,12 +938,14 @@ class MoE(nn.Module):
             sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
 
             # Unsort and reduce: accumulate weighted outputs back to [N, D]
-            # Create mapping from sorted position → original token index
+            # Use index_add_ instead of scatter_add_ with expanded index to avoid
+            # materializing a [N*K, D] int64 index tensor (~4GB at ablation scale).
+            # index_add_ broadcasts the 1-D index across trailing dimensions.
             orig_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, K).reshape(N * K)
             orig_token_idx = orig_token_idx[sort_order]  # [N*K] — which token each sorted entry belongs to
 
             routed_output = torch.zeros_like(x)  # [N, D]
-            routed_output.scatter_add_(0, orig_token_idx.unsqueeze(-1).expand_as(sorted_output), sorted_output)
+            routed_output.index_add_(0, orig_token_idx, sorted_output)
 
         # Shared expert — processes ALL tokens (unless ablation-disabled)
         if self.disable_shared_experts:
@@ -1258,17 +1335,18 @@ class NanoSeekDecoderLayer(nn.Module):
         intermediate_size: int = 5243,
         # MoE (for later layers)
         use_moe: bool = False,
-        n_routed_experts: int = 64,
+        n_routed_experts: int = 16,
         n_shared_experts: int = 2,
-        num_experts_per_tok: int = 8,
+        num_experts_per_tok: int = 2,
         moe_intermediate_size: int = 768,
         shared_inter_dim: Optional[int] = None,
         norm_topk_prob: bool = True,
         routed_scaling_factor: float = 2.5,
         n_group: int = 4,
-        topk_group: int = 2,
+        topk_group: int = 4,
         disable_shared_experts: bool = False,
         seq_aux_loss_alpha: float = 0.0001,
+        use_classic_aux_loss: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -1313,6 +1391,7 @@ class NanoSeekDecoderLayer(nn.Module):
                 shared_inter_dim=shared_inter_dim,
                 disable_shared_experts=disable_shared_experts,
                 seq_aux_loss_alpha=seq_aux_loss_alpha,
+                use_classic_aux_loss=use_classic_aux_loss,
             )
         else:
             self.ffn = Expert(hidden_size, intermediate_size)
@@ -1372,6 +1451,51 @@ class NanoSeekDecoderLayer(nn.Module):
 
 
 # =============================================================================
+# CHECKPOINT MIGRATION
+# =============================================================================
+
+def migrate_legacy_moe_state_dict(state_dict: dict) -> dict:
+    """Convert old ModuleList expert weights to native 3D parameters.
+
+    Old format: layers.{l}.ffn.routed_experts.{e}.w_{gate,up,down}.weight
+    New format: layers.{l}.ffn.w_{gate,up,down}  (3D: [E, out_features, in_features])
+
+    Returns state_dict unchanged if already in new format.
+    """
+    if not any('routed_experts.' in k for k in state_dict):
+        return state_dict  # Already new format
+
+    new_state = {}
+    # prefix -> {proj_name -> {idx -> tensor}}
+    expert_weights: Dict[str, Dict[str, Dict[int, Tensor]]] = {}
+
+    for key, value in state_dict.items():
+        if 'routed_experts.' in key:
+            # Parse: layers.2.ffn.routed_experts.5.w_gate.weight
+            prefix, rest = key.split('routed_experts.')
+            parts = rest.split('.')
+            idx = int(parts[0])
+            proj_name = parts[1]  # w_gate, w_up, or w_down
+
+            if prefix not in expert_weights:
+                expert_weights[prefix] = {}
+            if proj_name not in expert_weights[prefix]:
+                expert_weights[prefix][proj_name] = {}
+            expert_weights[prefix][proj_name][idx] = value
+        else:
+            new_state[key] = value
+
+    # Stack expert weights into 3D tensors
+    for prefix, proj_dict in expert_weights.items():
+        for proj_name, idx_dict in proj_dict.items():
+            n_experts = max(idx_dict.keys()) + 1
+            stacked = torch.stack([idx_dict[i] for i in range(n_experts)])
+            new_state[f"{prefix}{proj_name}"] = stacked
+
+    return new_state
+
+
+# =============================================================================
 # NANOSEEK MODEL
 # =============================================================================
 
@@ -1394,6 +1518,7 @@ class NanoSeekModel(nn.Module):
     def __init__(self, config: NanoSeekConfig):
         super().__init__()
         self.config = config
+        self._validate_config(config)  # Validate before proceeding
         self.logit_softcap = config.logit_softcap
 
         # Pad vocab to multiple of 64 for matmul alignment (nanochat pattern).
@@ -1440,6 +1565,7 @@ class NanoSeekModel(nn.Module):
                 topk_group=config.moe.topk_group,
                 disable_shared_experts=config.moe.disable_shared_experts,
                 seq_aux_loss_alpha=config.moe.seq_aux_loss_alpha,
+                use_classic_aux_loss=config.moe.use_classic_aux_loss,
             ))
 
         # ---- Final norm + LM head ----
@@ -1477,7 +1603,7 @@ class NanoSeekModel(nn.Module):
         self._layer_aux_data: Dict[int, Dict[str, Tensor]] = {}
 
         # ---- Gradient checkpointing (selective) ----
-        # PERF: Only checkpoint MoE layers (memory-heavy due to 64 experts).
+        # PERF: Only checkpoint MoE layers (memory-heavy due to routed experts).
         # Skip dense layers (0, cheap) and last 2 layers (activations still live
         # in memory during backward). Saves ~15-25% recomputation cost vs
         # checkpointing all layers, with minimal memory increase.
@@ -1493,13 +1619,74 @@ class NanoSeekModel(nn.Module):
             self._checkpoint_layer_ids = set()
 
         # ---- Initialize weights ----
-        self.init_weights()
+        # Direct construction on a real device still initializes eagerly so
+        # tests and utility scripts behave as expected. Meta-device
+        # construction must skip this and defer to the explicit to_empty() ->
+        # init_weights() sequence.
+        if not any(p.is_meta for p in self.parameters()):
+            self.init_weights()
+
+    def _validate_config(self, config: NanoSeekConfig) -> None:
+        """Validate configuration parameters for logical consistency.
+        
+        Raises:
+            ValueError: If config parameters are invalid or incompatible
+        """
+        # Vocabulary size
+        if config.vocab_size <= 0:
+            raise ValueError(f"vocab_size must be > 0, got {config.vocab_size}")
+        if config.vocab_size > 1_000_000:
+            raise ValueError(f"vocab_size suspiciously large: {config.vocab_size}")
+        
+        # Hidden dimension
+        if config.hidden_size <= 0:
+            raise ValueError(f"hidden_size must be > 0, got {config.hidden_size}")
+        if config.hidden_size % 64 != 0:
+            raise ValueError(f"hidden_size should be divisible by 64, got {config.hidden_size}")
+        
+        # Number of heads
+        if config.num_heads <= 0:
+            raise ValueError(f"num_heads must be > 0, got {config.num_heads}")
+        if config.hidden_size % config.num_heads != 0:
+            raise ValueError(
+                f"hidden_size ({config.hidden_size}) must be divisible by "
+                f"num_heads ({config.num_heads})"
+            )
+        
+        # Sequence length
+        if config.max_position_embeddings <= 0:
+            raise ValueError(f"max_position_embeddings must be > 0, got {config.max_position_embeddings}")
+        
+        # MoE parameters
+        moe = config.moe
+        if moe.n_routed_experts <= 0:
+            raise ValueError(f"n_routed_experts must be > 0, got {moe.n_routed_experts}")
+        if moe.num_experts_per_tok > moe.n_routed_experts:
+            raise ValueError(
+                f"num_experts_per_tok ({moe.num_experts_per_tok}) cannot exceed "
+                f"n_routed_experts ({moe.n_routed_experts})"
+            )
+        if moe.n_group > moe.n_routed_experts:
+            raise ValueError(
+                f"n_group ({moe.n_group}) cannot exceed n_routed_experts ({moe.n_routed_experts})"
+            )
+        if moe.topk_group > moe.n_group:
+            raise ValueError(
+                f"topk_group ({moe.topk_group}) cannot exceed n_group ({moe.n_group})"
+            )
+        
+        # MTP parameters
+        mtp = config.mtp
+        if mtp.num_mtp_modules < 0:
+            raise ValueError(f"num_mtp_modules must be >= 0, got {mtp.num_mtp_modules}")
+        if mtp.mtp_loss_decay < 0 or mtp.mtp_loss_decay > 1:
+            raise ValueError(f"mtp_loss_decay must be in [0, 1], got {mtp.mtp_loss_decay}")
 
     def init_weights(self) -> None:
         """Public API for weight initialization.
 
         Called explicitly after to_empty(device=...) in pre_train.py,
-        and implicitly during __init__().
+        and on direct non-meta construction.
         """
         self._init_weights()
         self._reinit_buffers()
@@ -1513,22 +1700,23 @@ class NanoSeekModel(nn.Module):
         This method recomputes any buffers that require non-trivial initialization.
         """
         config = self.config
-        # Compute RoPE frequencies ONCE and share across all layers
-        rope_freqs = precompute_freqs_cis(
+        # Compute RoPE frequencies ONCE
+        rope_freqs_base = precompute_freqs_cis(
             config.mla.qk_rope_head_dim,
             config.max_position_embeddings,
             config.mla.rope_theta,
             config.mla.rope_scaling_factor,
             config.mla.original_max_position_embeddings,
         )
+        # Assign to decoder layers (clone for defensive isolation)
         for layer in self.layers:
             attn = layer.self_attn
-            attn.freqs_cis = rope_freqs.to(device=attn.freqs_cis.device)
-        # MTP also has its own MLA with freqs_cis
+            attn.freqs_cis = rope_freqs_base.clone().to(device=attn.freqs_cis.device)
+        # MTP also has its own MLA with freqs_cis (clone for safety)
         if self.mtp is not None:
             for mtp_mod in self.mtp.mtp_modules:
                 mtp_attn = mtp_mod.transformer.attn
-                mtp_attn.freqs_cis = rope_freqs.to(device=mtp_attn.freqs_cis.device)
+                mtp_attn.freqs_cis = rope_freqs_base.clone().to(device=mtp_attn.freqs_cis.device)
 
     def _init_weights(self) -> None:
         """Width-dependent weight initialization with zero-init output projections.
@@ -1557,7 +1745,7 @@ class NanoSeekModel(nn.Module):
         # Small-scale init for output projections (near-identity at init).
         # Zero-init works for dense models (GPT-2/nanochat pattern), but for MoE:
         # - Router starts with random weights + zero bias
-        # - All 64 experts start identical with zero output
+        # - All 16 experts start identical with zero output
         # - Only gradient signal to router comes from embedding→lm_head skip path
         # This causes slow early training / routing collapse.
         # DeepSeek V3 Technical Report: "All learnable parameters are randomly
@@ -1570,10 +1758,14 @@ class NanoSeekModel(nn.Module):
             # Dense FFN layer (first_k_dense layers)
             if isinstance(layer.ffn, Expert):
                 torch.nn.init.normal_(layer.ffn.w_down.weight, mean=0.0, std=output_std)
-            # MoE layer: small-scale init all routed + shared expert w_down
+            # MoE layer: init 3D routed expert weights + shared expert w_down
             elif isinstance(layer.ffn, MoE):
-                for expert in layer.ffn.routed_experts:
-                    torch.nn.init.normal_(expert.w_down.weight, mean=0.0, std=output_std)
+                # 3D expert params (nn.Parameter, NOT nn.Linear) are not caught
+                # by the generic init walk above — init them explicitly here.
+                torch.nn.init.normal_(layer.ffn.w_gate, mean=0.0, std=std)
+                torch.nn.init.normal_(layer.ffn.w_up, mean=0.0, std=std)
+                # Output projections: small-scale init
+                torch.nn.init.normal_(layer.ffn.w_down, mean=0.0, std=output_std)
                 torch.nn.init.normal_(layer.ffn.shared_expert.w_down.weight, mean=0.0, std=output_std)
         # MTP concat_proj: small random init (NOT zero — zero kills all forward signal,
         # producing exactly uniform logits and loss = ln(V) with zero gradient to MTP params).
@@ -1617,7 +1809,36 @@ class NanoSeekModel(nn.Module):
                 past_key_values: list of KV caches (None if use_cache=False)
                 aux_loss:        scalar averaged MoE load-balancing loss
         """
+        # ---- Input validation ----
+        if input_ids.dim() != 2:
+            raise ValueError(f"input_ids must be 2D [B, S], got shape {input_ids.shape}")
+        
         B, S = input_ids.shape
+        
+        if S > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Sequence length {S} exceeds max_position_embeddings "
+                f"{self.config.max_position_embeddings}"
+            )
+        
+        if input_ids.dtype not in (torch.long, torch.int64):
+            raise ValueError(f"input_ids must be int64, got {input_ids.dtype}")
+        
+        if torch.any(input_ids < 0) or torch.any(input_ids >= self.config.vocab_size):
+            raise ValueError(
+                f"input_ids values must be in range [0, {self.config.vocab_size}), "
+                f"got min={input_ids.min()}, max={input_ids.max()}"
+            )
+        
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError(
+                    f"labels shape {labels.shape} must match input_ids shape {input_ids.shape}"
+                )
+        
+        if mtp_lambda < 0 or mtp_lambda > 1:
+            raise ValueError(f"mtp_lambda must be in [0, 1], got {mtp_lambda}")
+        # ---- End validation ----
 
         # 1. Token embedding (no post-embedding norm)
         # DeepSeek V3 does NOT have post-embedding RMSNorm. Parameterless norm
@@ -1674,9 +1895,15 @@ class NanoSeekModel(nn.Module):
             if "aux_loss" in aux_data:
                 total_aux_loss = total_aux_loss + aux_data["aux_loss"]
                 n_aux_layers += 1
-                self._layer_aux_data[i] = aux_data
+                # Preserve the original forward's routing stats. Gradient
+                # checkpoint recompute during backward must not overwrite them.
+                if i not in self._layer_aux_data:
+                    self._layer_aux_data[i] = aux_data
 
         # 4. Final norm
+        # MTP applies its own RMSNorm internally and should see the decoder
+        # output before the model's final normalization.
+        pre_norm_hidden_states = hidden_states
         hidden_states = self.norm(hidden_states)  # [B, S, H]
 
         # 5. LM head + logit softcap
@@ -1696,7 +1923,7 @@ class NanoSeekModel(nn.Module):
         # mtp_lambda is passed as a function parameter — do NOT shadow it here
         if labels is not None:
             loss_dict = self._compute_loss(
-                logits, labels, hidden_states, input_ids,
+                logits, labels, pre_norm_hidden_states, input_ids,
                 total_aux_loss, n_aux_layers,
                 mtp_lambda,
             )
@@ -1738,7 +1965,7 @@ class NanoSeekModel(nn.Module):
         Args:
             logits: [B, S, V] — model predictions
             labels: [B, S] — target tokens
-            hidden_states: [B, S, H] — post-norm hidden states (for MTP)
+            hidden_states: [B, S, H] — pre-final-norm hidden states (for MTP)
             input_ids: [B, S] — original input (for MTP token shifting)
             total_aux_loss: accumulated MoE load-balancing loss
             n_aux_layers: number of MoE layers that contributed
@@ -1793,17 +2020,28 @@ class NanoSeekModel(nn.Module):
             return 0.0
         return self.config.moe.gamma
 
-    def update_load_balance_bias(
-        self, tokens_processed: int, total_tokens: int
-    ) -> None:
+    def update_load_balance_bias(self, tokens_processed: int = 0, total_tokens: int = 0) -> None:
         """Update expert routing biases for load balancing.
 
-        Called by training loop after each optimizer step.
-        Uses load_counts cached from the most recent forward pass.
-        Formula: b_i -= gamma * (load_i - mean_load) / mean_load
+        DeepSeek V3 auxiliary-loss-free load balancing:
+        - Maintains dynamic bias vector per expert
+        - Updates bias after each optimizer step based on observed load imbalance
+        - Formula: b_i -= gamma * (load_i - mean_load) / mean_load
+        - Freezes at gamma_freeze_ratio (95%) of training — call with tokens_processed
+          and total_tokens so the freeze logic engages correctly.
+
+        Args:
+            tokens_processed: cumulative tokens seen so far (used for freeze schedule)
+            total_tokens: total training token budget (used for freeze schedule)
+                          Pass both as 0 to skip freeze (test mode — uses full gamma).
+
+        Example usage in training loop:
+            model.update_load_balance_bias(tokens_processed, config.total_tokens)
         """
+        # get_gamma() enforces the 95% freeze: returns 0.0 after gamma_freeze_ratio
+        # When called with defaults (0, 0), get_gamma returns full config gamma (test mode).
         gamma = self.get_gamma(tokens_processed, total_tokens)
-        if gamma <= 0:
+        if gamma <= 0.0:
             return
         for layer_idx, aux_data in self._layer_aux_data.items():
             if "load_counts" in aux_data:
@@ -1814,7 +2052,7 @@ class NanoSeekModel(nn.Module):
     def num_parameters(self) -> Dict[str, int]:
         """Return active and total parameter counts.
 
-        Active params exclude inactive routed experts (64 - 8 = 56 per MoE layer).
+        Active params exclude inactive routed experts (16 - 2 = 14 per MoE layer, nano scale).
         """
         total = sum(p.numel() for p in self.parameters())
 
@@ -2149,8 +2387,8 @@ def test_nanoseek() -> None:
 
     # ---- Test 7: Load balance bias update ----
     _ = model(input_ids, labels=labels, mtp_lambda=0.3)
-    model.update_load_balance_bias(mtp_lambda=0.3)
-    print("  Test 7: Load balance bias update — no crash")
+    model.update_load_balance_bias()  # Simplified API: no parameters needed
+    print("  Test 7: Load balance bias update — successful")
     model.zero_grad()
 
     # ---- Test 8: Gamma schedule ----
@@ -2180,4 +2418,3 @@ def test_nanoseek() -> None:
 
 if __name__ == "__main__":
     test_nanoseek()
-

@@ -613,7 +613,7 @@ def load_model_for_eval(
     Returns:
         Tuple of (model, loaded_step)
     """
-    from .model import NanoSeekModel
+    from .model import NanoSeekModel, migrate_legacy_moe_state_dict
 
     # Build model
     with torch.device("meta"):
@@ -622,10 +622,11 @@ def load_model_for_eval(
     model.to_empty(device=device)
     model.init_weights()
 
-    # Load checkpoint
+    # Load checkpoint (with legacy ModuleList → 3D migration if needed)
     model_state, metadata, loaded_step = load_checkpoint(
         checkpoint_dir, step, device
     )
+    model_state = migrate_legacy_moe_state_dict(model_state)
     model.load_state_dict(model_state)
 
     # Load EMA if requested

@@ -563,12 +563,9 @@ class TestMoE:
         assert small_moe.shared_expert.w_gate.weight.grad is not None, \
             "Shared expert should have gradient"
 
-        # At least some routed experts should have gradients
-        experts_with_grad = sum(
-            1 for e in small_moe.routed_experts
-            if e.w_gate.weight.grad is not None and e.w_gate.weight.grad.abs().sum() > 0
-        )
-        assert experts_with_grad > 0, "Some routed experts should have gradients"
+        # Routed expert weights (3D params) should have gradients
+        assert small_moe.w_gate.grad is not None and small_moe.w_gate.grad.abs().sum() > 0, \
+            "Routed expert w_gate should have gradient"
 
     def test_bias_no_gradient_through_moe(self, small_moe):
         """Bias buffer should NOT accumulate gradients through MoE forward."""
@@ -625,13 +622,18 @@ class TestMoE:
         assert not torch.isnan(out).any()
 
     def test_routed_experts_count(self, small_moe):
-        """Correct number of routed experts instantiated."""
-        assert len(small_moe.routed_experts) == 16
+        """Correct number of routed experts in 3D weight tensors."""
+        assert small_moe.w_gate.shape[0] == 16
+        assert small_moe.w_up.shape[0] == 16
+        assert small_moe.w_down.shape[0] == 16
 
     def test_routed_expert_inter_dim(self, small_moe):
-        """Routed experts have correct inter_dim."""
-        for expert in small_moe.routed_experts:
-            assert expert.w_gate.out_features == 256  # moe_inter_dim
+        """Routed experts have correct inter_dim in 3D layout."""
+        # w_gate: [E, D, I] — dim 2 is inter_dim
+        assert small_moe.w_gate.shape[2] == 256  # moe_inter_dim
+        assert small_moe.w_up.shape[2] == 256
+        # w_down: [E, I, D] — dim 1 is inter_dim
+        assert small_moe.w_down.shape[1] == 256
 
     def test_large_batch(self, small_moe):
         """MoE handles larger batches without issues."""
@@ -704,7 +706,7 @@ class TestMoEIntegration:
         for k in range(2):  # K=2
             expert_idx = indices[0, k].item()
             w = weights[0, k].item()
-            expert_out = moe.routed_experts[expert_idx](token_0)  # [1, D]
+            expert_out = moe.expert_forward(expert_idx, token_0)  # [1, D]
             manual_routed += w * expert_out
 
         # Get MoE output and subtract shared expert contribution
@@ -810,7 +812,7 @@ class TestMoEIntegration:
         )
 
         # Verify dimensions
-        assert len(moe.routed_experts) == 64
+        assert moe.w_gate.shape[0] == 64
         assert moe.shared_expert.w_gate.out_features == 1536  # 2 * 768
         assert moe.gate.router_weight.out_features == 64
 
@@ -917,8 +919,8 @@ class TestBatchedDispatch:
                     cnt = counts_cpu[expert_idx]
                     if cnt == 0:
                         continue
-                    sorted_output[offset:offset + cnt] = moe.routed_experts[expert_idx](
-                        sorted_x[offset:offset + cnt]
+                    sorted_output[offset:offset + cnt] = moe.expert_forward(
+                        expert_idx, sorted_x[offset:offset + cnt]
                     )
                     offset += cnt
 
@@ -983,14 +985,15 @@ class TestBatchedDispatch:
                 msg=f"Gradient differs for {name}",
             )
 
-    def test_checkpoint_names_unchanged(self):
-        """Batched dispatch must not change parameter names (checkpoint compat)."""
+    def test_checkpoint_names_3d_format(self):
+        """State dict uses native 3D expert param names."""
         moe = self._make_moe()
         names = set(moe.state_dict().keys())
-        # Key pattern: routed_experts.{idx}.w_{gate,up,down}.weight
-        assert any("routed_experts.0.w_gate.weight" in n for n in names)
-        assert any("routed_experts.0.w_down.weight" in n for n in names)
-        assert any("shared_expert.w_gate.weight" in n for n in names)
+        # Key pattern: w_{gate,up,down} (3D tensors)
+        assert "w_gate" in names, f"Missing w_gate in {names}"
+        assert "w_up" in names, f"Missing w_up in {names}"
+        assert "w_down" in names, f"Missing w_down in {names}"
+        assert "shared_expert.w_gate.weight" in names
 
     def test_padding_neutrality(self):
         """Padded zeros must not affect output or gradients.

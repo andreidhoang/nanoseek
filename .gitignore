@@ -37,3 +37,18 @@ nanochat/
 checkpoints/
 base_data_climbmix/
 
+# Global training artifacts and docs
+**/checkpoints/
+**/docs/
+
+# Dev docs (keep README.md)
+CLAUDE.md
+**/CLAUDE.md
+KAPATHY.md
+PERFORMANCE_OPTIMIZATION.md
+SCALING_LAWS.md
+SCALING_LAWS_VI.md
+TRAINING_FAILURE_ANALYSIS.md
+TRAINING_FAILURE_ANALYSIS_PART2.md
+docs/
+

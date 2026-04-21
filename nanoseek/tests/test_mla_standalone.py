@@ -269,6 +269,27 @@ class TestAbsorbMode:
         max_diff = (out_n - out_a).abs().max().item()
         assert max_diff < 1e-3, f"Absorb vs naive decode mismatch: {max_diff}"
 
+    def test_absorb_matches_naive_with_cached_chunk(self):
+        """Absorb and naive must match for cached multi-token suffixes, not just 1-token decode."""
+        torch.manual_seed(42)
+        mla = MultiHeadLatentAttention(**MLA_KWARGS).to(DEVICE)
+        mla.eval()
+
+        prompt = torch.randn(1, 8, mla.hidden_size, device=DEVICE)
+        suffix = torch.randn(1, 5, mla.hidden_size, device=DEVICE)
+
+        with torch.no_grad():
+            mla.absorb = False
+            _, cache_n = mla(prompt, use_cache=True)
+            out_n, _ = mla(suffix, past_key_value=cache_n, use_cache=True)
+
+            mla.absorb = True
+            _, cache_a = mla(prompt, use_cache=True)
+            out_a, _ = mla(suffix, past_key_value=cache_a, use_cache=True)
+
+        max_diff = (out_n - out_a).abs().max().item()
+        assert max_diff < 1e-3, f"Absorb vs naive cached chunk mismatch: {max_diff}"
+
 
 # ─── 6. Causal Masking ────────────────────────────────────────────────────────
 

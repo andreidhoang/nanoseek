@@ -141,15 +141,15 @@ def mla_minimal(minimal_config, device):
 def moe_minimal(minimal_config, device):
     """Minimal MoE for unit tests."""
     moe = MoE(
-        dim=minimal_config.hidden_size,
+        hidden_dim=minimal_config.hidden_size,
         moe_inter_dim=minimal_config.moe.moe_intermediate_size,
         n_routed_experts=minimal_config.moe.n_routed_experts,
-        n_activated_experts=minimal_config.moe.num_experts_per_tok,
+        num_experts_per_tok=minimal_config.moe.num_experts_per_tok,
         n_shared_experts=minimal_config.moe.n_shared_experts,
-        n_expert_groups=minimal_config.moe.n_group,
-        n_limited_groups=minimal_config.moe.topk_group,
-        score_func=minimal_config.moe.scoring_func,
-        route_scale=minimal_config.moe.routed_scaling_factor,
+        n_group=minimal_config.moe.n_group,
+        topk_group=minimal_config.moe.topk_group,
+        scoring_func=minimal_config.moe.scoring_func,
+        routed_scaling_factor=minimal_config.moe.routed_scaling_factor,
         seq_aux_loss_alpha=minimal_config.moe.seq_aux_loss_alpha,
     )
     return moe.to(device)

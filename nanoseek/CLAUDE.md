@@ -35,11 +35,13 @@ HEAD_DIM = 128            # num_heads = hidden_size / 128
 Q_LORA_RATIO = 0.215      # q_lora_rank / hidden_size
 KV_LORA_RATIO = 0.070     # kv_lora_rank / hidden_size
 
-# MoE topology (constant across all scales)
-N_ROUTED_EXPERTS = 64
-NUM_EXPERTS_PER_TOK = 8    # top-k
+# MoE topology (nano-scale adjusted — see config.py for conservation law derivation)
+N_ROUTED_EXPERTS = 16      # V3 original: 64. Conservation law: 16×1.5 = 64×0.375 = 24
+NUM_EXPERTS_PER_TOK = 2    # top-k. Sparsity ratio: 2/16 = 8/64 = 12.5% (identical)
 N_SHARED_EXPERTS = 2
-MOE_INTER_RATIO = 0.375    # moe_intermediate_size / hidden_size
+N_GROUP = 4                # = TOPK_GROUP → pure top-k routing (no EP group constraint)
+TOPK_GROUP = 4
+MOE_INTER_RATIO = 1.5      # Nano-scale (V3 original: 0.375 at 7168h)
 
 # Training
 GAMMA_FREEZE_RATIO = 0.95
