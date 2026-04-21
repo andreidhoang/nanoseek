@@ -42,8 +42,6 @@ base_data_climbmix/
 **/docs/
 
 # Dev docs (keep README.md)
-CLAUDE.md
-**/CLAUDE.md
 KAPATHY.md
 PERFORMANCE_OPTIMIZATION.md
 SCALING_LAWS.md
